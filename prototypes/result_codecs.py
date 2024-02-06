@@ -60,7 +60,13 @@ class LossyU16(Codec):
 
     def decode(self, encoded: bytes, meta: Dict[str, Any]) -> np.ndarray:
         encoded = np.frombuffer(encoded, dtype=np.uint8)
-        arr_uint16 = np.frombuffer(bitshuffle.decompress_lz4(encoded), dtype=np.uint16)
+        arr_uint16 = np.frombuffer(
+            bitshuffle.decompress_lz4(
+                encoded,
+                dtype=np.uint16,
+                shape=meta["shape"],
+            ),
+        )
         return map_from_uint16(arr_uint16, meta["offset"], meta["scale"])
 
 
