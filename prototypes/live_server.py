@@ -2,6 +2,7 @@ import time
 import json
 import asyncio
 import typing
+from typing import Dict, Any
 import copy
 from collections import OrderedDict
 import math
@@ -14,7 +15,6 @@ import uuid
 import websockets
 from websockets.legacy.server import WebSocketServerProtocol
 from websockets.legacy.client import WebSocketClientProtocol
-import bitshuffle
 
 from libertem import masks
 from libertem.udf.sum import SumUDF
@@ -34,31 +34,31 @@ from libertem_icom.udf.icom import ICoMUDF
 if typing.TYPE_CHECKING:
     from libertem.common.executor import JobExecutor
 
+from result_codecs import BsLz4, LossyU16
+
 
 log = logging.getLogger(__name__)
 
 
 @enum.unique
 class Encoding(enum.StrEnum):
-    DeltaBsLZ4 = "delta-bs-lz4"
-    LossyU16 = "lossy-u16-bs-lz4"
-
-
-# raise Exception("FIXME: actually implement lossy compression from float data")
+    DeltaBsLZ4 = "bslz4"
+    LossyU16 = "lossy-u16-bslz4"
 
 
 class EncodedResult:
     def __init__(
-            self,
-            compressed_data: memoryview,
-            bbox: typing.Tuple[int, int, int, int],
-            full_shape: typing.Tuple[int, int],
-            delta_shape: typing.Tuple[int, int],
-            dtype: str,
-            # encoding: 
-            channel_name: str,
-            udf_name: str,
-        ):
+        self,
+        compressed_data: memoryview,
+        bbox: typing.Tuple[int, int, int, int],
+        full_shape: typing.Tuple[int, int],
+        delta_shape: typing.Tuple[int, int],
+        dtype: str,
+        encoding: str,
+        encoding_meta: Dict[str, Any],
+        channel_name: str,
+        udf_name: str,
+    ):
         self.compressed_data = compressed_data
         self.bbox = bbox
         self.full_shape = full_shape
@@ -66,6 +66,8 @@ class EncodedResult:
         self.dtype = dtype
         self.channel_name = channel_name
         self.udf_name = udf_name
+        self.encoding = encoding
+        self.encoding_meta = encoding_meta
 
     def is_empty(self):
         return len(self.compressed_data) == 0
@@ -229,7 +231,9 @@ class WSServer:
     async def broadcast(self, msg):
         websockets.broadcast(self.ws_connected, msg)
 
-    async def make_deltas(self, partial_results: UDFResults, previous_results: typing.Optional[UDFResults]) -> np.ndarray:
+    async def make_deltas(
+        self, partial_results: UDFResults, previous_results: typing.Optional[UDFResults]
+    ) -> np.ndarray:
         deltas = []
         udf_names = list(self.udfs.keys())
         for idx in range(len(partial_results.buffers)):
@@ -252,7 +256,9 @@ class WSServer:
                 })
         return deltas
 
-    async def encode_result(self, delta: np.ndarray, udf_name: str, channel_name: str) -> EncodedResult:
+    async def encode_result(
+        self, delta: np.ndarray, udf_name: str, channel_name: str
+    ) -> EncodedResult:
         """
         Slice `delta` to its non-zero region and compress that. Returns the information
         needed to reconstruct the the full result.
@@ -260,7 +266,7 @@ class WSServer:
         nonzero_mask = ~np.isclose(0, delta)
 
         if np.count_nonzero(nonzero_mask) == 0:
-            print(f"zero-delta update, skipping")
+            print("zero-delta update, skipping")
             # skip this update if it is all-zero
             return EncodedResult(
                 compressed_data=memoryview(b""),
@@ -270,29 +276,33 @@ class WSServer:
                 dtype=delta.dtype,
                 channel_name=channel_name,
                 udf_name=udf_name,
+                encoding=Encoding.DeltaBsLZ4,
             )
 
         bbox = get_bbox(delta)
         ymin, ymax, xmin, xmax = bbox
         delta_for_blit = delta[ymin:ymax + 1, xmin:xmax + 1]
-        # print(delta_for_blit.shape, delta_for_blit, list(delta_for_blit[-1]))
+
+        if delta.dtype.kind == 'f':
+            encoding = Encoding.LossyU16
+            codec = LossyU16()
+        else:
+            encoding = Encoding.DeltaBsLZ4
+            codec = BsLz4()
+        compressed, encoding_meta = await sync_to_async(lambda: codec.encode(delta_for_blit))
 
         log.debug("encode_result: bbox=%r", bbox)
-
-        # FIXME: remove allocating copy - maybe copy into pre-allocated buffer instead?
-        # compressed = await sync_to_async(lambda: lz4.frame.compress(np.copy(delta_for_blit)))
-        # copy is needed to make the slice contiguous
-        # (in case not the whole x range is part of the bbox)
-        compressed = await sync_to_async(lambda: bitshuffle.compress_lz4(np.copy(delta_for_blit)))
 
         return EncodedResult(
             compressed_data=memoryview(compressed),
             bbox=bbox,
             full_shape=delta.shape,
             delta_shape=delta_for_blit.shape,
-            dtype=delta_for_blit.dtype,
+            dtype=delta.dtype,
             channel_name=channel_name,
             udf_name=udf_name,
+            encoding=encoding,
+            encoding_meta=encoding_meta,
         )
 
     async def handle_pending_acquisition(self, pending) -> str:
@@ -302,12 +312,6 @@ class WSServer:
             "id": acq_id,
         }))
         return acq_id
-
-    async def handle_acquisition_end(self, pending, acq_id: str):
-        await self.broadcast(json.dumps({
-            "event": "ACQUISITION_STARTED",
-            "id": acq_id,
-        }))
 
     async def handle_acquisition_end(self, pending, acq_id: str):
         await self.broadcast(json.dumps({
@@ -343,7 +347,8 @@ class WSServer:
                     "full_shape": result.full_shape,
                     "delta_shape": result.delta_shape,
                     "dtype": str(result.dtype),
-                    "encoding": "bslz4",
+                    "encoding": result.encoding,
+                    "encoding_meta": result.encoding_meta,
                     "channel_name": result.channel_name,
                     "udf_name": result.udf_name,
                 }
@@ -394,7 +399,9 @@ class WSServer:
 
                         if time.time() - last_update > min_delta:
                             async with self.lock:
-                                await self.handle_partial_result(partial_results, acq_id, previous_results)
+                                await self.handle_partial_result(
+                                    partial_results, acq_id, previous_results
+                                )
                                 self.results.update_result(acq_id, partial_results)
                                 previous_results = copy.deepcopy(partial_results)
                             last_update = time.time()
@@ -403,7 +410,7 @@ class WSServer:
                         await self.handle_partial_result(partial_results, acq_id, previous_results)
                         self.results.update_result(acq_id, partial_results)
                     num_updates += 1
-                except Exception as e:
+                except Exception:
                     import traceback
                     traceback.print_exc()
                     self.ctx.close()
@@ -415,7 +422,8 @@ class WSServer:
                 self.results.clear()
             previous_results = None
             t1 = time.perf_counter()
-            print(f"acquisition done with id={acq_id}; took {t1-t0:.3f}s; num_updates={num_updates}")
+            print(f"acquisition done with id={acq_id}; "
+                  f"took {t1-t0:.3f}s; num_updates={num_updates}")
             num_updates = 0
 
     async def serve(self):
@@ -451,9 +459,9 @@ class WSServer:
         )
 
         self.conn = conn
-        self.executor = executor
         self.ctx = ctx
         log.info("live server connected and ready")
+
 
 async def main():
     log.info("live server starting up...")
