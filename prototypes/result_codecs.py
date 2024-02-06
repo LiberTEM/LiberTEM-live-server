@@ -60,12 +60,10 @@ class LossyU16(Codec):
 
     def decode(self, encoded: bytes, meta: Dict[str, Any]) -> np.ndarray:
         encoded = np.frombuffer(encoded, dtype=np.uint8)
-        arr_uint16 = np.frombuffer(
-            bitshuffle.decompress_lz4(
-                encoded,
-                dtype=np.uint16,
-                shape=meta["shape"],
-            ),
+        arr_uint16 = bitshuffle.decompress_lz4(
+            encoded,
+            dtype=np.dtype(np.uint16),
+            shape=meta["shape"],
         )
         return map_from_uint16(arr_uint16, meta["offset"], meta["scale"])
 
@@ -84,7 +82,7 @@ class BsLz4(Codec):
         encoded = np.frombuffer(encoded, dtype=np.uint8)
         return bitshuffle.decompress_lz4(
             encoded,
-            dtype=meta['dtype'],
+            dtype=np.dtype(meta['dtype']),
             shape=meta['shape'],
         )
 
@@ -115,5 +113,21 @@ try:
             data,
             map_from_uint16(res, offset, scale),
         )
+
+    def test_codec_roundtrip_lossy_u16():
+        # this fits into the range, so should be allclose:
+        data = np.array([0, 2, 65535], dtype=np.float32)
+        codec = LossyU16()
+        compressed, meta = codec.encode(data)
+        result = codec.decode(compressed, meta)
+        assert np.allclose(result, data)
+
+    def test_codec_roundtrip_bslz4():
+        data = np.array([0, 2, 65535], dtype=np.float32)
+        codec = BsLz4()
+        compressed, meta = codec.encode(data)
+        result = codec.decode(compressed, meta)
+        assert np.allclose(result, data)
+
 except ImportError:
     pass
