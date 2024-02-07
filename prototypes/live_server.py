@@ -2,12 +2,13 @@ import time
 import json
 import asyncio
 import typing
-from typing import Dict, Any
-import copy
+from typing import Dict, Any, Set, Tuple, Callable
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 import math
 import logging
 import enum
+import copy
 
 import numba
 import numpy as np
@@ -17,22 +18,20 @@ from websockets.legacy.server import WebSocketServerProtocol
 from websockets.legacy.client import WebSocketClientProtocol
 
 from libertem import masks
-from libertem.udf.sum import SumUDF
-from libertem.udf.sumsigudf import SumSigUDF
+from libertem.udf import UDF
+# from libertem.udf.sum import SumUDF
+# from libertem.udf.sumsigudf import SumSigUDF
 from libertem.udf.masks import ApplyMasksUDF
 from libertem.executor.pipelined import PipelinedExecutor
 from libertem_live.api import LiveContext
 from libertem_live.udf.monitor import (
-    SignalMonitorUDF, PartitionMonitorUDF
+    PartitionMonitorUDF
 )
 from libertem.common.tracing import maybe_setup_tracing
 
-from libertem.udf.base import UDFResults, UDF
+from libertem.udf.base import UDFResults
 from libertem.common.async_utils import sync_to_async
 from libertem_icom.udf.icom import ICoMUDF
-
-if typing.TYPE_CHECKING:
-    from libertem.common.executor import JobExecutor
 
 from result_codecs import BsLz4, LossyU16
 
@@ -44,6 +43,9 @@ log = logging.getLogger(__name__)
 class Encoding(enum.StrEnum):
     DeltaBsLZ4 = "bslz4"
     LossyU16 = "lossy-u16-bslz4"
+
+
+T = typing.TypeVar('T')
 
 
 class EncodedResult:
@@ -71,6 +73,315 @@ class EncodedResult:
 
     def is_empty(self):
         return len(self.compressed_data) == 0
+
+
+class Closed(Exception):
+    pass
+
+
+class LatestContainer(typing.Generic[T]):
+    """
+    Producer/consumer container that has at most one item inside.
+
+    Used here to make sure always the latest partial results are sent over.
+    """
+
+    def __init__(self):
+        self._item: typing.Optional[T] = None
+        self._cond = asyncio.Condition()
+        self._closed = False
+
+    async def take(self) -> T:
+        """
+        Wait until an item is available, and then return it, emptying the container.
+
+        If the container is closed, this can be called successfully one last
+        time, to retrieve the last item.
+
+        Raises `Closed` if the container is closed and empty.
+        """
+        if self._closed and self._item is None:
+            raise Closed()
+        async with self._cond:
+            await self._cond.wait_for(lambda: self._item is not None or self._closed)
+            if self._closed and self._item is None:
+                raise Closed()
+            item = self._item
+            self._item = None
+        return item
+
+    async def put(self, item: T):
+        """
+        Put an item into the container, or replaces the one that is currently in
+        there. Wakes up anyone waiting to `take`.
+
+        Raises `Closed` if the container is closed.
+        """
+        async with self._cond:
+            if self._closed:
+                raise Closed()
+            self._item = item
+            self._cond.notify_all()
+
+    async def close(self):
+        """
+        Mark this container as closed.
+        """
+        async with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+
+
+class ResultSampler:
+    """
+    This class holds references to all current websocket clients,
+    and starts per-client loops that send out results as fast as
+    the client can handle.
+    """
+    def __init__(self, parameters: "ParameterContainer", udfs: "UDFContainer"):
+        self.clients: Set[WebSocketClientProtocol] = set()
+        self.client_queues: Dict[
+            WebSocketClientProtocol,
+            asyncio.Queue[Tuple[str, LatestContainer[UDFResults]]]
+        ] = {}
+        self._sampler_tasks: Dict[WebSocketClientProtocol, asyncio.Task] = {}
+        self._min_delta = 1/60.0  # should this be a parameter?
+        self._parameters = parameters
+        self._udfs = udfs
+
+    @asynccontextmanager
+    async def handle_acquisition(self, acq_id: str) -> Callable[[UDFResults], None]:
+        # inform all our per-client sampler loops that a new acquisition was started,
+        # and give them access to a new `LatestContainer`
+        to_clients = {
+            client: LatestContainer()
+            for client in self.clients
+        }
+        for client, lc in to_clients.items():
+            log.info("sending some LCs to sampler loops...")
+            await self.client_queues[client].put((acq_id, lc))
+
+        # an inner helper that is given to the caller to push results to
+        # clients:
+        async def _result_sink(partial_results: UDFResults):
+            result_copy = copy.deepcopy(partial_results)
+            for client in to_clients:
+                await to_clients[client].put(result_copy)
+                await self._check_task_status()
+
+        yield _result_sink
+        for lc in to_clients.values():
+            await lc.close()
+
+    async def _check_task_status(self):
+        for client, task in self._sampler_tasks.items():
+            if task.done():
+                exc = task.exception()
+                if exc is not None:
+                    raise exc
+
+    async def add_client(self, client: WebSocketClientProtocol):
+        self.clients.add(client)
+        self.client_queues[client] = asyncio.Queue()
+        await self._spawn_task(client)
+
+    async def remove_client(self, client: WebSocketClientProtocol):
+        self.clients.remove(client)
+        del self.client_queues[client]
+        await self._cancel_task(client)
+
+    async def _spawn_task(self, client: WebSocketClientProtocol):
+        self._sampler_tasks[client] = asyncio.ensure_future(self.sampler_loop(client))
+
+    async def _cancel_task(self, client: WebSocketClientProtocol):
+        task = self._sampler_tasks[client]
+        del self._sampler_tasks[client]
+        task.cancel()
+
+    async def send_initial(self, websocket: WebSocketClientProtocol):
+        await websocket.send(json.dumps({
+            'event': 'UPDATE_PARAMS',
+            'parameters': self._parameters.get_parameters(),
+        }))
+        # for acq_id in self.results.keys():
+        #     result = self.results.get_result(acq_id)
+        #     await self.handle_partial_result(
+        #         result=result,
+        #         acq_id=acq_id,
+        #         previous_results=None,
+        #         client=websocket,
+        #     )
+
+    async def make_deltas(
+        self, partial_results: UDFResults, previous_results: typing.Optional[UDFResults]
+    ) -> np.ndarray:
+        deltas = []
+        udf_names = list(self._udfs.get_udfs().keys())
+        for idx in range(len(partial_results.buffers)):
+            udf_name = udf_names[idx]
+            for channel_name in partial_results.buffers[idx].keys():
+                data = partial_results.buffers[idx][channel_name].data
+                # filter out non-2d result channels:
+                if len(data.shape) != 2:
+                    continue
+                if previous_results is None:
+                    data_previous = np.zeros_like(data)
+                else:
+                    data_previous = previous_results.buffers[idx][channel_name].data
+
+                delta = data - data_previous
+                deltas.append({
+                    'delta': delta,
+                    'udf_name': udf_name,
+                    'channel_name': channel_name,
+                })
+        return deltas
+
+    async def encode_result(
+        self, delta: np.ndarray, udf_name: str, channel_name: str
+    ) -> EncodedResult:
+        """
+        Slice `delta` to its non-zero region and compress that. Returns the information
+        needed to reconstruct the the full result.
+        """
+        loop = asyncio.get_running_loop()
+        nonzero_mask = await loop.run_in_executor(None, lambda: ~np.isclose(0, delta))
+
+        if np.count_nonzero(nonzero_mask) == 0:
+            log.debug("zero-delta update, skipping")
+            # skip this update if it is all-zero
+            return EncodedResult(
+                compressed_data=memoryview(b""),
+                bbox=(0, 0, 0, 0),
+                full_shape=delta.shape,
+                delta_shape=(0, 0),
+                dtype=delta.dtype,
+                channel_name=channel_name,
+                udf_name=udf_name,
+                encoding=Encoding.DeltaBsLZ4,
+                encoding_meta={
+                    "shape": (0, 0),
+                    "dtype": "uint8",
+                },
+            )
+
+        bbox = get_bbox(delta)
+        ymin, ymax, xmin, xmax = bbox
+        delta_for_blit = delta[ymin:ymax + 1, xmin:xmax + 1]
+
+        # FIXME: lossy/lossless selection in UDF somehow? be smart about it? for large bboxes?
+        # or for large updates byte-wise?
+        if delta.dtype.kind == 'f' and delta_for_blit.nbytes > 1024*64:
+            encoding = Encoding.LossyU16
+            codec = LossyU16()
+            log.debug(f"encoding channel {channel_name} of udf {udf_name} as lossy")
+        else:
+            encoding = Encoding.DeltaBsLZ4
+            codec = BsLz4()
+        compressed, encoding_meta = await sync_to_async(lambda: codec.encode(delta_for_blit))
+
+        log.debug("encode_result: bbox=%r", bbox)
+
+        return EncodedResult(
+            compressed_data=memoryview(compressed),
+            bbox=bbox,
+            full_shape=delta.shape,
+            delta_shape=delta_for_blit.shape,
+            dtype=delta.dtype,
+            channel_name=channel_name,
+            udf_name=udf_name,
+            encoding=encoding,
+            encoding_meta=encoding_meta,
+        )
+
+    async def handle_partial_result(
+        self,
+        client: WebSocketClientProtocol,
+        previous_results: typing.Optional[UDFResults],
+        partial_results: UDFResults,
+        acq_id: str,
+    ):
+        deltas = await self.make_deltas(partial_results, previous_results)
+
+        delta_results: typing.List[EncodedResult] = []
+        for delta in deltas:
+            delta_results.append(
+                await self.encode_result(
+                    delta['delta'],
+                    delta['udf_name'],
+                    delta['channel_name']
+                )
+            )
+        header_msg = json.dumps({
+            "event": "RESULT",
+            "id": acq_id,
+            "timestamp": time.time(),
+            "channels": [
+                {
+                    "bbox": result.bbox,
+                    "full_shape": result.full_shape,
+                    "delta_shape": result.delta_shape,
+                    "dtype": str(result.dtype),
+                    "encoding": result.encoding,
+                    "encoding_meta": result.encoding_meta,
+                    "channel_name": result.channel_name,
+                    "udf_name": result.udf_name,
+                }
+                for result in delta_results
+            ],
+        }, indent=4)
+
+        # log.info("header_msg: %s", header_msg)
+
+        await client.send(header_msg)
+        for result in delta_results:
+            await client.send(result.compressed_data)
+
+    async def sampler_loop(self, client: WebSocketClientProtocol):
+        """
+        This loop is spawned as a task per-client, and takes care of
+        synchronizing the result state.
+
+        It also means that we have to take care of sampling the current state at
+        the beginning of the connection, so we have an idea of what the client
+        knows about.
+        """
+        log.info(f"sampler_loop started for {client.remote_address}")
+        await self.send_initial(client)
+        last_update = time.monotonic()
+        while True:
+            log.info(
+                f"sampler_loop waiting for next acquisition for client {client.remote_address}"
+            )
+            # first, let's get the `LatestContainer` for the current acquisition:
+            acq_id, lc = await self.client_queues[client].get()
+
+            log.info(f"got our lc for {acq_id} / {client.remote_address}")
+
+            previous_results = None
+            while True:
+                # if we are sending faster than the results become available,
+                # we will wait here for the next result, otherwise we'll simply take
+                # the latest available (the other end might have called `put` multiple times
+                # in the mean time):
+                since_last_update = time.monotonic() - last_update
+                # make sure we respect the maximum update rate:
+                if since_last_update < self._min_delta:
+                    await asyncio.sleep(self._min_delta - since_last_update)
+                try:
+                    latest = await lc.take()
+                    log.debug(
+                        f"got a new result in acquisition {acq_id} for {client.remote_address}"
+                    )
+                except Closed:
+                    break  # acquisition is done, wait for the next one
+                await self.handle_partial_result(
+                    client=client,
+                    previous_results=previous_results,
+                    partial_results=latest,
+                    acq_id=acq_id,
+                )
+                previous_results = latest
 
 
 @numba.njit(cache=True)
@@ -118,45 +429,47 @@ class SingleMaskUDF(ApplyMasksUDF):
         }
 
 
-class ResultTracker:
-    def __init__(self):
-        self._data = {}
+class ParameterContainer:
+    def __init__(self, parameters: Dict[str, Any]):
+        self.parameters = parameters
 
-    def update_result(self, key, result):
-        self._data[key] = result
+    def set_parameters(self, parameters: Dict[str, Any]):
+        self.parameters = parameters
 
-    def get_result(self, key):
-        return self._data[key]
+    def get_parameters(self) -> Dict[str, Any]:
+        return self.parameters
 
-    def remove_result(self, key):
-        del self._data[key]
 
-    def clear(self):
-        self._data = {}
+class UDFContainer:
+    def __init__(self, udfs: OrderedDict[str, UDF]):
+        self._udfs = udfs
 
-    def keys(self):
-        return list(self._data.keys())
+    def get_udfs(self) -> OrderedDict[str, UDF]:
+        return self._udfs
+
+    def set_udfs(self, udfs: OrderedDict[str, UDF]):
+        self._udfs = udfs
 
 
 class WSServer:
     def __init__(self):
         self.connect()
         self.ws_connected = set()
-        self.parameters = {
+        self.parameters = ParameterContainer({
             'cx': 516/2.0,
             'cy': 512/2.0,
             'ri': 200.0,
             'ro': 530.0,
-        }
-        self.udfs = self.get_udfs()
-        self.results = ResultTracker()
-        self.lock = asyncio.Lock()
+        })
+        self.udfs = UDFContainer(self.get_udfs())
+        self.sampler = ResultSampler(parameters=self.parameters, udfs=self.udfs)
 
-    def get_udfs(self):
-        cx = self.parameters['cx']
-        cy = self.parameters['cy']
-        ri = self.parameters['ri']
-        ro = self.parameters['ro']
+    def get_udfs(self) -> OrderedDict[str, "UDF"]:
+        parameters = self.parameters.get_parameters()
+        cx = parameters['cx']
+        cy = parameters['cy']
+        ri = parameters['ri']
+        ro = parameters['ro']
 
         def _ring():
             return masks.ring(
@@ -178,41 +491,30 @@ class WSServer:
             # "sum": SumUDF(),
             # "monitor": SignalMonitorUDF(),
             "monitor_partition": PartitionMonitorUDF(),
-            # "icom": ICoMUDF.with_params(cx=cx, cy=cy, r=ro, flip_y=True),
+            "icom": ICoMUDF.with_params(cx=cx, cy=cy, r=ro, flip_y=True),
         })
 
     async def __call__(self, websocket: WebSocketServerProtocol):
         await self.client_loop(websocket)
 
-    async def send_state_dump(self, websocket: WebSocketClientProtocol):
-        await websocket.send(json.dumps({
-            'event': 'UPDATE_PARAMS',
-            'parameters': self.parameters,
-        }))
-        for key in self.results.keys():
-            result = self.results.get_result(key)
-            await self.handle_partial_result(
-                result, key, previous_results=None, dest=websocket
-            )
-
-    def register_client(self, websocket):
+    async def register_client(self, websocket: WebSocketClientProtocol):
         self.ws_connected.add(websocket)
+        await self.sampler.add_client(websocket)
 
-    def unregister_client(self, websocket):
+    async def unregister_client(self, websocket: WebSocketClientProtocol):
         self.ws_connected.remove(websocket)
+        await self.sampler.remove_client(websocket)
 
     async def client_loop(self, websocket: WebSocketClientProtocol):
         try:
             try:
-                async with self.lock:
-                    await self.send_state_dump(websocket)
-                    self.register_client(websocket)
+                await self.register_client(websocket)
                 async for msg in websocket:
                     await self.handle_message(msg, websocket)
             except websockets.exceptions.ConnectionClosedError:
                 await websocket.close()
         finally:
-            self.unregister_client(websocket)
+            await self.unregister_client(websocket)
 
     async def handle_message(self, msg, websocket):
         try:
@@ -220,8 +522,8 @@ class WSServer:
             # FIXME: hack to not require the 'event' "tag":
             if 'event' not in msg or msg['event'] == 'UPDATE_PARAMS':
                 print(f"parameter update: {msg}")
-                self.parameters = msg['parameters']
-                self.udfs = self.get_udfs()
+                self.parameters.set_parameters(msg['parameters'])
+                self.udfs.set_udfs(self.get_udfs())
                 # broadcast to all clients:
                 msg['event'] = 'UPDATE_PARAMS'
                 await self.broadcast(json.dumps(msg))
@@ -230,80 +532,6 @@ class WSServer:
 
     async def broadcast(self, msg):
         websockets.broadcast(self.ws_connected, msg)
-
-    async def make_deltas(
-        self, partial_results: UDFResults, previous_results: typing.Optional[UDFResults]
-    ) -> np.ndarray:
-        deltas = []
-        udf_names = list(self.udfs.keys())
-        for idx in range(len(partial_results.buffers)):
-            udf_name = udf_names[idx]
-            for channel_name in partial_results.buffers[idx].keys():
-                data = partial_results.buffers[idx][channel_name].data
-                # filter out non-2d result channels:
-                if len(data.shape) != 2:
-                    continue
-                if previous_results is None:
-                    data_previous = np.zeros_like(data)
-                else:
-                    data_previous = previous_results.buffers[idx][channel_name].data
-
-                delta = data - data_previous
-                deltas.append({
-                    'delta': delta,
-                    'udf_name': udf_name,
-                    'channel_name': channel_name,
-                })
-        return deltas
-
-    async def encode_result(
-        self, delta: np.ndarray, udf_name: str, channel_name: str
-    ) -> EncodedResult:
-        """
-        Slice `delta` to its non-zero region and compress that. Returns the information
-        needed to reconstruct the the full result.
-        """
-        nonzero_mask = ~np.isclose(0, delta)
-
-        if np.count_nonzero(nonzero_mask) == 0:
-            print("zero-delta update, skipping")
-            # skip this update if it is all-zero
-            return EncodedResult(
-                compressed_data=memoryview(b""),
-                bbox=(0, 0, 0, 0),
-                full_shape=delta.shape,
-                delta_shape=(0, 0),
-                dtype=delta.dtype,
-                channel_name=channel_name,
-                udf_name=udf_name,
-                encoding=Encoding.DeltaBsLZ4,
-            )
-
-        bbox = get_bbox(delta)
-        ymin, ymax, xmin, xmax = bbox
-        delta_for_blit = delta[ymin:ymax + 1, xmin:xmax + 1]
-
-        if delta.dtype.kind == 'f':
-            encoding = Encoding.LossyU16
-            codec = LossyU16()
-        else:
-            encoding = Encoding.DeltaBsLZ4
-            codec = BsLz4()
-        compressed, encoding_meta = await sync_to_async(lambda: codec.encode(delta_for_blit))
-
-        log.debug("encode_result: bbox=%r", bbox)
-
-        return EncodedResult(
-            compressed_data=memoryview(compressed),
-            bbox=bbox,
-            full_shape=delta.shape,
-            delta_shape=delta_for_blit.shape,
-            dtype=delta.dtype,
-            channel_name=channel_name,
-            udf_name=udf_name,
-            encoding=encoding,
-            encoding_meta=encoding_meta,
-        )
 
     async def handle_pending_acquisition(self, pending) -> str:
         acq_id = str(uuid.uuid4())
@@ -319,53 +547,7 @@ class WSServer:
             "id": acq_id,
         }))
 
-    async def handle_partial_result(
-        self,
-        partial_results: UDFResults,
-        acq_id: str,
-        previous_results: typing.Optional[UDFResults],
-        dest: typing.Optional[WebSocketClientProtocol] = None,
-    ):
-        deltas = await self.make_deltas(partial_results, previous_results)
-
-        delta_results: typing.List[EncodedResult] = []
-        for delta in deltas:
-            delta_results.append(
-                await self.encode_result(
-                    delta['delta'],
-                    delta['udf_name'],
-                    delta['channel_name']
-                )
-            )
-        header_msg = json.dumps({
-            "event": "RESULT",
-            "id": acq_id,
-            "timestamp": time.time(),
-            "channels": [
-                {
-                    "bbox": result.bbox,
-                    "full_shape": result.full_shape,
-                    "delta_shape": result.delta_shape,
-                    "dtype": str(result.dtype),
-                    "encoding": result.encoding,
-                    "encoding_meta": result.encoding_meta,
-                    "channel_name": result.channel_name,
-                    "udf_name": result.udf_name,
-                }
-                for result in delta_results
-            ],
-        })
-        if dest is None:
-            fn = self.broadcast
-        else:
-            fn = dest.send
-
-        await fn(header_msg)
-        for result in delta_results:
-            await fn(result.compressed_data)
-
     async def acquisition_loop(self):
-        min_delta = 0.01
         while True:
             pending_aq = await sync_to_async(self.conn.wait_for_acquisition, timeout=10)
             if pending_aq is None:
@@ -375,65 +557,52 @@ class WSServer:
                 print(f"acquisition starting with id={acq_id}")
                 t0 = time.perf_counter()
                 num_updates = 0
-                previous_results = None
                 partial_results = None
                 side = int(math.sqrt(pending_aq.detector_config.get_num_frames()))
                 aq = self.ctx.make_acquisition(
                     conn=self.conn,
                     pending_aq=pending_aq,
-                    frames_per_partition=side,
+                    frames_per_partition=20*side,
                     nav_shape=(side, side),
                 )
-                last_update = 0
                 try:
-                    udfs_only = list(self.udfs.values())
+                    udfs_only = list(self.udfs.get_udfs().values())
                     params = [udf._kwargs for udf in udfs_only]
                     part_res_iter = self.ctx.run_udf_iter(dataset=aq, udf=udfs_only, sync=False)
-                    async for partial_results in part_res_iter:
-                        # parameter update:
-                        udfs_only = list(self.udfs.values())
-                        new_params = [udf._kwargs for udf in udfs_only]
-                        if new_params != params:  # change detection
-                            await part_res_iter.update_parameters_experimental(new_params)
-                            params = new_params
-
-                        if time.time() - last_update > min_delta:
-                            async with self.lock:
-                                await self.handle_partial_result(
-                                    partial_results, acq_id, previous_results
-                                )
-                                self.results.update_result(acq_id, partial_results)
-                                previous_results = copy.deepcopy(partial_results)
-                            last_update = time.time()
+                    async with self.sampler.handle_acquisition(acq_id=acq_id) as result_sink:
+                        async for partial_results in part_res_iter:
+                            # parameter update:
+                            udfs_only = list(self.udfs.get_udfs().values())
+                            new_params = [udf._kwargs for udf in udfs_only]
+                            if new_params != params:  # change detection
+                                await part_res_iter.update_parameters_experimental(new_params)
+                                params = new_params
+                            await result_sink(partial_results)
                             num_updates += 1
-                    async with self.lock:
-                        await self.handle_partial_result(partial_results, acq_id, previous_results)
-                        self.results.update_result(acq_id, partial_results)
-                    num_updates += 1
+                        await result_sink(partial_results)
+                        num_updates += 1
                 except Exception:
                     import traceback
                     traceback.print_exc()
                     self.ctx.close()
                     self.conn.close()
                     self.connect()
-                previous_results = copy.deepcopy(partial_results)
             finally:
                 await self.handle_acquisition_end(pending_aq, acq_id)
-                self.results.clear()
-            previous_results = None
             t1 = time.perf_counter()
             print(f"acquisition done with id={acq_id}; "
                   f"took {t1-t0:.3f}s; num_updates={num_updates}")
             num_updates = 0
 
     async def serve(self):
-        async with websockets.serve(self, "localhost", 8444):
+        # disable compression since we do our own lz4 for larger messages:
+        async with websockets.serve(self, "localhost", 8444, compression=None):
             while True:
                 try:
                     try:
                         await self.acquisition_loop()
                     except Exception:
-                        log.exception("exception in acquisition loop")
+                        log.exception("Exception in acquisition loop")
                         self.ctx.close()
                         self.conn.close()
                         self.connect()
