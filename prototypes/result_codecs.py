@@ -1,7 +1,6 @@
 from typing import Dict, Any
 
 import numpy as np
-import bitshuffle
 
 
 def map_from_uint16(data: np.ndarray, offset: float, scale: float) -> np.ndarray:
@@ -48,6 +47,7 @@ class Codec:
 
 class LossyU16(Codec):
     def encode(self, arr: np.ndarray) -> (bytes, Dict[str, Any]):
+        import bitshuffle
         mapped_arr, offset, scale = map_to_uint16(arr)
         mapped_arr = mapped_arr.astype(np.uint16)
         encoding_meta = {
@@ -59,6 +59,7 @@ class LossyU16(Codec):
         return arr_compressed, encoding_meta
 
     def decode(self, encoded: bytes, meta: Dict[str, Any]) -> np.ndarray:
+        import bitshuffle
         encoded = np.frombuffer(encoded, dtype=np.uint8)
         arr_uint16 = bitshuffle.decompress_lz4(
             encoded,
@@ -70,6 +71,7 @@ class LossyU16(Codec):
 
 class BsLz4(Codec):
     def encode(self, arr: np.ndarray) -> (bytes, Dict[str, Any]):
+        import bitshuffle
         if not arr.flags.c_contiguous:
             arr = np.copy(arr)
         arr_compressed = bitshuffle.compress_lz4(arr)
@@ -79,6 +81,7 @@ class BsLz4(Codec):
         }
 
     def decode(self, encoded: bytes, meta: Dict[str, Any]) -> np.ndarray:
+        import bitshuffle
         encoded = np.frombuffer(encoded, dtype=np.uint8)
         return bitshuffle.decompress_lz4(
             encoded,

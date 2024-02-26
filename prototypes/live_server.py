@@ -1,8 +1,11 @@
+import os
+os.environ['OMP_NUM_THREADS'] = '1'  # must come before numba (because of OMP stuff?)
+
 import time
 import json
 import asyncio
 import typing
-from typing import Dict, Any, Set, Tuple, Callable
+from typing import Dict, Any, Set, Tuple, Callable, AsyncGenerator
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 import math
@@ -150,7 +153,9 @@ class ResultSampler:
         self._udfs = udfs
 
     @asynccontextmanager
-    async def handle_acquisition(self, acq_id: str) -> Callable[[UDFResults], None]:
+    async def handle_acquisition(self, acq_id: str) -> AsyncGenerator[
+        Callable[[UDFResults], None], None
+    ]:
         # inform all our per-client sampler loops that a new acquisition was started,
         # and give them access to a new `LatestContainer`
         to_clients = {
@@ -491,7 +496,7 @@ class WSServer:
             # "sum": SumUDF(),
             # "monitor": SignalMonitorUDF(),
             "monitor_partition": PartitionMonitorUDF(),
-            "icom": ICoMUDF.with_params(cx=cx, cy=cy, r=ro, flip_y=True),
+            # "icom": ICoMUDF.with_params(cx=cx, cy=cy, r=ro, flip_y=True),
         })
 
     async def __call__(self, websocket: WebSocketServerProtocol):
@@ -562,7 +567,8 @@ class WSServer:
                 aq = self.ctx.make_acquisition(
                     conn=self.conn,
                     pending_aq=pending_aq,
-                    frames_per_partition=20*side,
+                    # frames_per_partition=10 * int(2/3 * side),
+                    frames_per_partition=1 * side,
                     nav_shape=(side, side),
                 )
                 try:
@@ -614,7 +620,7 @@ class WSServer:
     def connect(self):
         executor = PipelinedExecutor(
             spec=PipelinedExecutor.make_spec(
-                cpus=range(20), cudas=[]
+                cpus=range(10), cudas=[]
             ),
             pin_workers=False,
         )
