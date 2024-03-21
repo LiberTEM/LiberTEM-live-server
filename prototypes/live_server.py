@@ -30,6 +30,7 @@ from libertem.udf import UDF
 from libertem.udf.masks import ApplyMasksUDF
 from libertem.executor.pipelined import PipelinedExecutor
 from libertem_live.api import LiveContext
+from libertem.api import Context
 from libertem_live.udf.monitor import (
     PartitionMonitorUDF
 )
@@ -39,6 +40,7 @@ from libertem.udf.base import UDFResults
 from libertem.common.async_utils import sync_to_async
 # from libertem_icom.udf.icom import ICoMUDF
 from libertem.udf.com import CoMUDF
+from libertem.udf.raw import PickCorrectedUDF
 
 from result_codecs import BsLz4, LossyU16
 
@@ -549,8 +551,74 @@ class WSServer:
                 # broadcast to all clients:
                 msg['event'] = 'UPDATE_PARAMS'
                 await self.broadcast(json.dumps(msg))
+
+            elif msg["event"] == "PREPARE_CORRECTED_PICK":
+                asyncio.ensure_future(self.prepare_descan_corrected(msg["params"]))
+
+            elif msg["event"] == "OFFLINE_PROCESSING":
+                if msg["udf"] == "CORRECTED_PICK":
+                    params = msg.get("params", {})
+                    asyncio.ensure_future(self.pick_descan_corrected(params))
+
         except Exception as e:
             print(e)
+            raise
+
+    
+    async def offline_processing(self, udf, **kwargs):
+        return await self.offlinectx.run_udf(udf=udf, sync=False, **kwargs)
+    
+    
+    async def prepare_descan_corrected(self, params):
+
+        
+        print("CPICK TO PREPARED")
+
+        self.corpick_dataset = self.offlinectx.load(filetype = "mib", path=params["dataset"])
+
+        comudf = CoMUDF.with_params(cy=128, cx=128, r=1000, regression=1)
+        comresult = await self.offline_processing(comudf, dataset=self.corpick_dataset)
+        self.regression_coefficients = comresult["regression"].data
+        self.picknavimg = comresult["field_x"].data
+        
+
+        codec = BsLz4()
+        compressed, encoding_meta = await sync_to_async(lambda: codec.encode(self.picknavimg))
+
+        await self.broadcast(
+            json.dumps({
+                "event" : "CORRECTED_PICK_PREPARED",
+                "encoding_meta" : encoding_meta
+            })
+        )
+
+        await self.broadcast(
+            memoryview(compressed)
+        )
+        
+        print("CPICK PREPARED")
+    
+    async def pick_descan_corrected(self, params):
+
+        corrpickudf = PickCorrectedUDF(regression_coefficients=self.regression_coefficients)
+        result = await self.offline_processing(corrpickudf, dataset=self.corpick_dataset, **params)
+
+        resultimg = result["intensity"].data
+
+        codec = BsLz4()
+        compressed, encoding_meta = await sync_to_async(lambda: codec.encode(resultimg))
+
+        await self.broadcast(
+            json.dumps({
+                "event": "CORRECTED_PICK",
+                "encoding_meta": encoding_meta
+            })
+        )
+
+        await self.broadcast(
+            memoryview(compressed)
+        )
+
 
     async def broadcast(self, msg):
         websockets.broadcast(self.ws_connected, msg)
@@ -653,8 +721,11 @@ class WSServer:
             **detector_settings["connection_arguments"]
         )
 
+        offlinectx = Context()
+        
         self.conn = conn
         self.ctx = ctx
+        self.offlinectx = offlinectx
         log.info("live server connected and ready")
 
 
