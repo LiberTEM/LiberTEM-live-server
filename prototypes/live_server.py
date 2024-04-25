@@ -5,7 +5,7 @@ import time
 import json
 import asyncio
 import typing
-from typing import Dict, Any, Set, Tuple, Callable, AsyncGenerator
+from typing import Coroutine, Dict, Any, Set, Tuple, Callable, AsyncGenerator
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 import math
@@ -89,7 +89,7 @@ class LatestContainer(typing.Generic[T]):
     Used here to make sure always the latest partial results are sent over.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._item: typing.Optional[T] = None
         self._cond = asyncio.Condition()
         self._closed = False
@@ -111,6 +111,9 @@ class LatestContainer(typing.Generic[T]):
                 raise Closed()
             item = self._item
             self._item = None
+
+        # this is enforced by the `wait_for` above, so this assert should never fail:
+        assert item is not None
         return item
 
     async def put(self, item: T):
@@ -154,11 +157,11 @@ class ResultSampler:
 
     @asynccontextmanager
     async def handle_acquisition(self, acq_id: str) -> AsyncGenerator[
-        Callable[[UDFResults], None], None
+        Callable[[UDFResults], Coroutine[None, None, None]], None
     ]:
         # inform all our per-client sampler loops that a new acquisition was started,
         # and give them access to a new `LatestContainer`
-        to_clients = {
+        to_clients: Dict[WebSocketClientProtocol, LatestContainer] = {
             client: LatestContainer()
             for client in self.clients
         }
@@ -169,7 +172,14 @@ class ResultSampler:
         # an inner helper that is given to the caller to push results to
         # clients:
         async def _result_sink(partial_results: UDFResults):
-            result_copy = copy.deepcopy(partial_results)
+            # result_copy = copy.deepcopy(partial_results)
+            result_copy = partial_results
+
+            if False:
+                # XXX
+                import cloudpickle
+                a = cloudpickle.dumps(result_copy)
+                print(len(a))
             for client in to_clients:
                 await to_clients[client].put(result_copy)
                 await self._check_task_status()
@@ -496,7 +506,11 @@ class WSServer:
             # "sum": SumUDF(),
             # "monitor": SignalMonitorUDF(),
             "monitor_partition": PartitionMonitorUDF(),
-            # "icom": ICoMUDF.with_params(cx=cx, cy=cy, r=ro, flip_y=True),
+            "icom": ICoMUDF.with_params(
+                cx=cx, cy=cy, r=ro, flip_y=True,
+                # regression=1,
+                scan_rotation=152.0,
+            ),
         })
 
     async def __call__(self, websocket: WebSocketServerProtocol):
