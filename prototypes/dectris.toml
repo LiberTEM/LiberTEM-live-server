@@ -1,0 +1,8 @@
+detector_type = "dectris"
+
+[connection_arguments]
+api_host='localhost'
+api_port=8910
+data_host='localhost'
+data_port=9999
+buffer_size=2048
