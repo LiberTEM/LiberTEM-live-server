@@ -17,6 +17,9 @@ import numba
 import numpy as np
 import uuid
 import websockets
+import click
+import tomllib
+
 from websockets.legacy.server import WebSocketServerProtocol
 from websockets.legacy.client import WebSocketClientProtocol
 
@@ -34,7 +37,8 @@ from libertem.common.tracing import maybe_setup_tracing
 
 from libertem.udf.base import UDFResults
 from libertem.common.async_utils import sync_to_async
-from libertem_icom.udf.icom import ICoMUDF
+# from libertem_icom.udf.icom import ICoMUDF
+from libertem.udf.com import CoMUDF
 
 from result_codecs import BsLz4, LossyU16
 
@@ -467,8 +471,7 @@ class UDFContainer:
 
 
 class WSServer:
-    def __init__(self):
-        self.connect()
+    def __init__(self, detector_settings_file):
         self.ws_connected = set()
         self.parameters = ParameterContainer({
             'cx': 516/2.0,
@@ -476,8 +479,11 @@ class WSServer:
             'ri': 200.0,
             'ro': 530.0,
         })
+        self.detector_settings_file = detector_settings_file
         self.udfs = UDFContainer(self.get_udfs())
         self.sampler = ResultSampler(parameters=self.parameters, udfs=self.udfs)
+        
+        self.connect()
 
     def get_udfs(self) -> OrderedDict[str, "UDF"]:
         parameters = self.parameters.get_parameters()
@@ -506,11 +512,8 @@ class WSServer:
             # "sum": SumUDF(),
             # "monitor": SignalMonitorUDF(),
             "monitor_partition": PartitionMonitorUDF(),
-            "icom": ICoMUDF.with_params(
-                cx=cx, cy=cy, r=ro, flip_y=True,
-                # regression=1,
-                scan_rotation=152.0,
-            ),
+            # "icom": ICoMUDF.with_params(cx=cx, cy=cy, r=ro, flip_y=True),
+            "com": CoMUDF.with_params(cx=cx, cy=cy, r=ro, flip_y=True, regression=1),
         })
 
     async def __call__(self, websocket: WebSocketServerProtocol):
@@ -577,7 +580,12 @@ class WSServer:
                 t0 = time.perf_counter()
                 num_updates = 0
                 partial_results = None
-                side = int(math.sqrt(pending_aq.detector_config.get_num_frames()))
+
+                if self.detector_type == "merlin":
+                    side = 256
+                else:
+                    side = int(math.sqrt(pending_aq.detector_config.get_num_frames()))
+
                 aq = self.ctx.make_acquisition(
                     conn=self.conn,
                     pending_aq=pending_aq,
@@ -634,31 +642,41 @@ class WSServer:
     def connect(self):
         executor = PipelinedExecutor(
             spec=PipelinedExecutor.make_spec(
-                cpus=range(10), cudas=[]
+                cpus=range(3), cudas=[]
             ),
             pin_workers=False,
+            startup_timeout=120
         )
         ctx = LiveContext(executor=executor)
-        conn = ctx.make_connection('dectris').open(
-            api_host='localhost',
-            api_port=8910,
-            data_host='localhost',
-            data_port=9999,
-            buffer_size=2048,
+
+        with open(self.detector_settings_file, "rb") as f:
+            detector_settings = tomllib.load(f)
+
+        conn = ctx.make_connection(detector_settings["detector_type"]).open(
+            **detector_settings["connection_arguments"]
         )
+        
+        # Temp fix for acquisition_loop when finding `side`
+        self.detector_type = detector_settings["detector_type"]
 
         self.conn = conn
         self.ctx = ctx
         log.info("live server connected and ready")
 
 
-async def main():
+async def main(detector_settings_file):
     log.info("live server starting up...")
-    server = WSServer()
+    server = WSServer(detector_settings_file=detector_settings_file)
     await server.serve()
 
 
-if __name__ == "__main__":
+@click.command()
+@click.argument("detector_settings_file", type=str)
+def cli(detector_settings_file):
     maybe_setup_tracing(service_name="libertem-live-server")
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(main())
+    asyncio.run(main(detector_settings_file))
+
+
+if __name__ == "__main__":
+    cli()
