@@ -581,10 +581,7 @@ class WSServer:
                 num_updates = 0
                 partial_results = None
 
-                if self.detector_type == "merlin":
-                    side = 256
-                else:
-                    side = int(math.sqrt(pending_aq.detector_config.get_num_frames()))
+                side = int(math.sqrt(pending_aq.nimages))
 
                 aq = self.ctx.make_acquisition(
                     conn=self.conn,
@@ -655,9 +652,6 @@ class WSServer:
         conn = ctx.make_connection(detector_settings["detector_type"]).open(
             **detector_settings["connection_arguments"]
         )
-        
-        # Temp fix for acquisition_loop when finding `side`
-        self.detector_type = detector_settings["detector_type"]
 
         self.conn = conn
         self.ctx = ctx
