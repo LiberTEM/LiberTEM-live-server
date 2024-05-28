@@ -40,7 +40,7 @@ from libertem.udf.base import UDFResults
 from libertem.common.async_utils import sync_to_async
 # from libertem_icom.udf.icom import ICoMUDF
 from libertem.udf.com import CoMUDF
-from libertem.udf.raw import PickCorrectedUDF
+from libertem.udf.raw import PickShiftedUDF
 
 from result_codecs import BsLz4, LossyU16
 
@@ -600,7 +600,7 @@ class WSServer:
     
     async def pick_descan_corrected(self, params):
 
-        corrpickudf = PickCorrectedUDF(regression_coefficients=self.regression_coefficients)
+        corrpickudf = PickShiftedUDF(regression_coefficients=self.regression_coefficients)
         result = await self.offline_processing(corrpickudf, dataset=self.corpick_dataset, **params)
 
         resultimg = result["intensity"].data
