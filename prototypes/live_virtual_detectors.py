@@ -71,12 +71,15 @@ class Plotter:
         self,
         state: "State",
         todo_event: threading.Event,
-        params_queue: queue.Queue,
+        params_queue: queue.Queue
     ):
         self.state = state
         self.todo_event = todo_event
         self._widget = None
         self._vd_params = None
+        self._corrpickwidget = None
+        self._cp_params = None
+        self._time_since_cp_pos = None
         self.data_models: Dict[str, ScriptDataModel] = {}
         self.si = PRScriptingInterface()
         self._params_queue = params_queue
@@ -114,6 +117,12 @@ class Plotter:
                             PRScriptingTypes.VirtualDetector
                         )
                         self._widget = virtual_detector
+                    elif key == "corrected_picker":
+                        corrected_picker = model.insert(
+                            PRScriptingTypes.VirtualDetector
+                        )
+                        self._corrpickwidget = corrected_picker
+                        print("CORRECTED_PICK_DISPLAYED")
                     print(f"data model: {self.data_models[key]}")
 
                 self.update_display_control(key, mask)
@@ -149,6 +158,28 @@ class Plotter:
                 dc.set_parameters(params)
 
     def update_params(self):
+        if self._corrpickwidget is not None:
+            params = self._corrpickwidget.get_parameters(scale_mode='pixel')
+            new_params = {
+                'cx': params['center'][0],
+                'cy': params['center'][1],
+            }
+            if self._cp_params != new_params:
+                self._cp_params = new_params
+                self._time_since_cp_pos = time.time()
+
+            if self._time_since_cp_pos is not None and time.time() - self._time_since_cp_pos  > 0.2:
+            
+                msg = json.dumps({
+                    "event": "OFFLINE_PROCESSING",
+                    "udf": "CORRECTED_PICK",
+                    "params": dict(roi=(int(self._cp_params['cx']+.5), int(self._cp_params['cy']+.5))),
+                })
+            
+                self._params_queue.put(msg)
+
+                self._time_since_cp_pos = None
+
         if self._widget is None:
             return None
         params = self._widget.get_parameters(scale_mode='pixel')
@@ -160,7 +191,13 @@ class Plotter:
         }
         if self._vd_params != new_params:
             self._vd_params = new_params
-            self._params_queue.put(new_params)
+            
+            msg = json.dumps({
+                "event": "UPDATE_PARAMS",
+                "parameters": params,
+            })
+        
+            self._params_queue.put(msg)
 
     def get_vd_params(self):
         return self._vd_params
@@ -256,18 +293,14 @@ class State:
 async def update_params_task(params_queue: queue.Queue, websocket):
     loop = asyncio.get_running_loop()
     while True:
-        params = await loop.run_in_executor(None, lambda: params_queue.get())
-        print("updated parameters", params)
-        await websocket.send(json.dumps({
-            "event": "UPDATE_PARAMS",
-            "parameters": params,
-        }))
-
+        msg = await loop.run_in_executor(None, lambda: params_queue.get())
+        # print("updated parameters", params)
+        await websocket.send(msg)
 
 class RecvThread(threading.Thread):
     def __init__(
         self, state: State, todo_event: threading.Event, plotter: Plotter, url: str,
-        params_queue: queue.Queue,
+        params_queue: queue.Queue
     ):
         self.state = state
         self.todo = todo_event
@@ -283,6 +316,8 @@ class RecvThread(threading.Thread):
             last_msg = None
 
             update_task = asyncio.ensure_future(update_params_task(self.params_queue, websocket))
+
+            await self.prepare_corrected_pick(websocket)
 
             try:
                 while True:
@@ -319,6 +354,33 @@ class RecvThread(threading.Thread):
                             delta_apply += t1 - t0
                         # print(f"decompression took {delta:.3f}s")
                         # print(f"apply took {delta_apply:.3f}s")
+                    elif event == "CORRECTED_PICK_PREPARED":
+                        print("CORRECTED_PICK_PREPARED")
+                        msg = await websocket.recv()
+                        codec = BsLz4()
+                        self.corpicknavimg = codec.decode(msg, decoded_msg["encoding_meta"])
+                        
+                        self.state.composed_data["corrected_picker"] = self.corpicknavimg
+                        self.state.valid_masks["corrected_picker"] = np.ones_like(self.corpicknavimg, dtype=bool)
+                        self.state.data["corrected_picker"] = self.state.composed_data["corrected_picker"]
+                        self.todo.set()
+                        print("CORRECTED_PICK_TO_DISPLAY")
+
+
+
+                    elif event == "CORRECTED_PICK":
+                        msg = await websocket.recv()
+                        codec = BsLz4()
+                        self.corrected_picked_image = codec.decode(msg, decoded_msg["encoding_meta"])
+                        
+                        self.state.composed_data["corrected_picked_image"] = \
+                            self.corrected_picked_image
+                        self.state.valid_masks["corrected_picked_image"] =  \
+                            np.ones_like(self.corrected_picked_image, dtype=bool)
+                        self.state.data["corrected_picked_image"] = self.state.composed_data["corrected_picked_image"]
+                        self.todo.set()
+
+
                     else:
                         print(f"last msg: {last_msg}")
             finally:
@@ -331,6 +393,23 @@ class RecvThread(threading.Thread):
             except Exception as e:
                 log.exception("got an exception in the main loop, reconnecting")
                 continue
+            except KeyboardInterrupt:
+                log.exception("interrupted, exiting")
+                sys.exit(1)
+            finally:
+                break
+
+    async def prepare_corrected_pick(self, websocket):
+
+        params = dict(
+            dataset=r"C:\Users\Sivert\Workbench\mib\2024_01_30_freestanding-LSMO_circle-tilt\20240131_175818\011_LMSTEM_256x256_Step=50x50_Rot=0_exposure=5ms_400msFlyback_T=-150.0C_TX=5.6_TY=2.1.hdr",
+        )
+        
+        await websocket.send(json.dumps({
+            "event": "PREPARE_CORRECTED_PICK",
+            "params": params,
+        }))
+        print("CPICK PREPARED")
 
     def run(self):
         asyncio.run(self.restart_loop())
@@ -345,7 +424,7 @@ def main(url):
     params_queue = queue.Queue(maxsize=0)
     plotter = Plotter(state=state, todo_event=todo, params_queue=params_queue)
     recv = RecvThread(
-        state=state, todo_event=todo, plotter=plotter, url=url, params_queue=params_queue,
+        state=state, todo_event=todo, plotter=plotter, url=url, params_queue=params_queue
     )
     recv.daemon = True
     recv.start()
