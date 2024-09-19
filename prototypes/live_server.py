@@ -590,6 +590,7 @@ class WSServer:
                     frames_per_partition=1 * side,
                     nav_shape=(side, side),
                 )
+                part_res_iter = None
                 try:
                     udfs_only = list(self.udfs.get_udfs().values())
                     params = [udf._kwargs for udf in udfs_only]
@@ -609,6 +610,8 @@ class WSServer:
                 except Exception:
                     import traceback
                     traceback.print_exc()
+                    if part_res_iter is not None:
+                        await part_res_iter.aclose()
                     self.ctx.close()
                     self.conn.close()
                     self.connect()
