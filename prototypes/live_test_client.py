@@ -1,37 +1,34 @@
-"""
-Live plots with widgets.
+"""Live plots with widgets.
 
 Must configure `live_server.py` to use only `monitor_partition` and `annular`
 UDFs (this is a limitation that can be lifted in production, this is only to
 demonstrate that widget interactivity is feasible).
 """
+from __future__ import annotations
 
-
-import sys
-import logging
-import time
-import json
 import asyncio
-import threading
+import json
+import logging
 import queue
-from typing import List, Dict, Any
-from typing_extensions import TypedDict
+import sys
+import threading
+import time
+from typing import Any, Dict, List
+import pprint
 
 import click
 import numpy as np
-import numba
-import bitshuffle
 import websockets
-from panta_rhei.scripting import PRScriptingInterface, PRScriptingTypes
-from panta_rhei.scripting.scripting_interface import ScriptDataModel
-from result_codecs import LossyU16, BsLz4
+from typing_extensions import TypedDict
 
+from result_codecs import BsLz4, LossyU16
 
 log = logging.getLogger(__name__)
 
 
 class ResultItem(TypedDict):
-    """
+    """Result as received from the server.
+
     Example instance of this class:
     {
         'bbox': [0, 515, 0, 515],
@@ -44,6 +41,7 @@ class ResultItem(TypedDict):
         'udf_name': 'monitor_partition'
     }
     """
+
     # List[int] because JSON doesn't tuple
     bbox: List[int]   # ymin, ymax, xmin, xmax: indices
     full_shape: List[int]
@@ -75,14 +73,9 @@ class Plotter:
     ):
         self.state = state
         self.todo_event = todo_event
-        self._widget = None
         self._vd_params = None
-        self._corrpickwidget = None
-        self._cp_params = None
-        self._time_since_cp_pos = None
-        self.data_models: Dict[str, ScriptDataModel] = {}
-        self.si = PRScriptingInterface()
         self._params_queue = params_queue
+        self._plots = {}
 
     def loop(self):
         # update as fast as possible, always using the most up-to-date state:
@@ -101,103 +94,35 @@ class Plotter:
                 self.todo_event.clear()
 
             t0 = time.time()
+            log.info("dumping fill rates...")
             for key in keys:
                 with self.state.data_lock:
                     arr = self.state.composed_data[key]
-                    # arr = self.state.data[key]
                     mask = self.state.valid_masks[key]
-                    self.si.data_to_repo(key, arr)
-
-                if key not in self.data_models:
-                    model = self.data_models[key] = self.si.display_image(key)
-                    # XXX: hacks - always put the virtual detector widget into
-                    # the monitor partition UDF result display:
-                    if key == "monitor_partition-intensity":
-                        virtual_detector = model.insert(
-                            PRScriptingTypes.VirtualDetector
-                        )
-                        self._widget = virtual_detector
-                    elif key == "corrected_picker":
-                        corrected_picker = model.insert(
-                            PRScriptingTypes.VirtualDetector
-                        )
-                        self._corrpickwidget = corrected_picker
-                        print("CORRECTED_PICK_DISPLAYED")
-                    print(f"data model: {self.data_models[key]}")
+                    log.info(f"fill rate for {key}: {np.count_nonzero(mask)/np.prod(mask.shape)}")
+                    import matplotlib.pyplot as plt
+                    if False:
+                        if key not in self._plots:
+                            fig, ax = plt.subplots(1)
+                            im = ax.imshow(arr)
+                            self._plots[key] = fig, ax, im
+                            plt.show(block=False)
+                        else:
+                            fig, ax, im = self._plots[key]
+                            im.set_data(arr)
+                            fig.canvas.draw_idle()
+                            fig.canvas.flush_events()
 
                 self.update_display_control(key, mask)
             t1 = time.time()
             if len(keys) > 0:
-                # print(f"plot updates: {t1-t0:.2f}s")
                 pass
 
     def update_display_control(self, key: str, mask: np.ndarray):
-        if key not in self.data_models:
-            return
-        if True:
-            with self.state.data_lock:
-                mask &= self.state.data[key] != 0
-                # XXX hacks...
-                # very simple "outlier removal" specifically for getting rid of
-                # the INT_MAX stuff that dectris does for bad pixels:
-                try:
-                    mask = mask & (self.state.data[key] != np.max(self.state.data[key][mask]))
-                except ValueError:
-                    pass  # meh...
-
-                valid_data = self.state.data[key][mask].copy()
-            if len(valid_data) > 0:
-                vmin = np.min(valid_data)
-                vmax = np.max(valid_data)
-                model = self.data_models[key]
-                dc = model.get_display_control()
-                params = dc.get_parameters()
-                params['levels'] = [vmin, vmax]
-                params['auto_contrast'] = False
-                # params['color_map'] = 'temperature'
-                dc.set_parameters(params)
+        pass
 
     def update_params(self):
-        if self._corrpickwidget is not None:
-            params = self._corrpickwidget.get_parameters(scale_mode='pixel')
-            new_params = {
-                'cx': params['center'][0],
-                'cy': params['center'][1],
-            }
-            if self._cp_params != new_params:
-                self._cp_params = new_params
-                self._time_since_cp_pos = time.time()
-
-            if self._time_since_cp_pos is not None and time.time() - self._time_since_cp_pos  > 0.2:
-            
-                msg = json.dumps({
-                    "event": "OFFLINE_PROCESSING",
-                    "udf": "CORRECTED_PICK",
-                    "params": dict(roi=(int(self._cp_params['cx']+.5), int(self._cp_params['cy']+.5))),
-                })
-            
-                self._params_queue.put(msg)
-
-                self._time_since_cp_pos = None
-
-        if self._widget is None:
-            return None
-        params = self._widget.get_parameters(scale_mode='pixel')
-        new_params = {
-            'ri': params['inner'],
-            'ro': params['outer'],
-            'cx': params['center'][0],
-            'cy': params['center'][1],
-        }
-        if self._vd_params != new_params:
-            self._vd_params = new_params
-            
-            msg = json.dumps({
-                "event": "UPDATE_PARAMS",
-                "parameters": new_params,
-            })
-        
-            self._params_queue.put(msg)
+        pass
 
     def get_vd_params(self):
         return self._vd_params
@@ -317,7 +242,7 @@ class RecvThread(threading.Thread):
 
             update_task = asyncio.ensure_future(update_params_task(self.params_queue, websocket))
 
-            # await self.prepare_corrected_pick(websocket)
+            await self.prepare_corrected_pick(websocket)
 
             try:
                 while True:
@@ -329,15 +254,24 @@ class RecvThread(threading.Thread):
 
                     event = decoded_msg['event']
                     if event == "ACQUISITION_STARTED":
-                        print(f"acquisition started: {decoded_msg['id']}")
+                        log.info(f"acquisition started: {decoded_msg['id']}")
                         self.state.acquisition_started(
                             acq_id=decoded_msg['id']
                         )
                     elif event == "ACQUISITION_ENDED":
+                        log.info(f"acquisition ended: {decoded_msg['id']}")
                         self.state.acquisition_ended(
                             acq_id=decoded_msg['id']
                         )
                     elif event == "RESULT":
+                        names = ",".join([c['channel_name'] for c in decoded_msg['channels']])
+                        summary = f"channels: {names}; id={decoded_msg['id']}; timestamp={decoded_msg['timestamp']}"
+                        log.info(f"RESULT message: {summary}")
+                        for c in decoded_msg['channels']:
+                            if c['channel_name'] == 'intensity_nav':
+                                print(c['bbox'])
+                            if c['channel_name'] == 'field_y':
+                                print(c['bbox'])
                         delta = 0.0
                         delta_apply = 0.0
                         for chan in decoded_msg['channels']:
@@ -402,7 +336,8 @@ class RecvThread(threading.Thread):
     async def prepare_corrected_pick(self, websocket):
 
         params = dict(
-            dataset=r"C:\Users\Sivert\Workbench\mib\2024_01_30_freestanding-LSMO_circle-tilt\20240131_175818\011_LMSTEM_256x256_Step=50x50_Rot=0_exposure=5ms_400msFlyback_T=-150.0C_TX=5.6_TY=2.1.hdr",
+            # dataset=r"C:\Users\Sivert\Workbench\mib\2024_01_30_freestanding-LSMO_circle-tilt\20240131_175818\011_LMSTEM_256x256_Step=50x50_Rot=0_exposure=5ms_400msFlyback_T=-150.0C_TX=5.6_TY=2.1.hdr",
+            dataset="/storage/er-c-data/adhoc/libertem/libertem-test-data/20200518 165148/default.hdr",
         )
         
         await websocket.send(json.dumps({
@@ -418,6 +353,7 @@ class RecvThread(threading.Thread):
 @click.command()
 @click.option('--url', type=str, default='ws://localhost:8444')
 def main(url):
+    logging.basicConfig(level=logging.INFO)
     todo = threading.Event()
     state = State(todo_event=todo)
 
