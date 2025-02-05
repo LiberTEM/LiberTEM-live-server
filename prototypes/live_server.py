@@ -25,8 +25,9 @@ from websockets.legacy.client import WebSocketClientProtocol
 
 from libertem import masks
 from libertem.udf import UDF
-# from libertem.udf.sum import SumUDF
-# from libertem.udf.sumsigudf import SumSigUDF
+from libertem.udf.sum import SumUDF
+from libertem.udf.sumsigudf import SumSigUDF
+from sumsigsegudf import SumSigSegUDF
 from libertem.udf.masks import ApplyMasksUDF
 from libertem.executor.pipelined import PipelinedExecutor
 from libertem_live.api import LiveContext
@@ -320,7 +321,18 @@ class ResultSampler:
         partial_results: UDFResults,
         acq_id: str,
     ):
+        previous_results = None
         deltas = await self.make_deltas(partial_results, previous_results)
+        self._prevdeltasnew = []
+        for i in range(len(deltas)):
+            self._prevdeltasnew.append(deltas[i].copy())
+            self._prevdeltasnew[-1]["delta"] = deltas[i]["delta"].copy()
+
+        if hasattr(self, "_prevdeltas"):
+            for i in range(len(deltas)):
+                deltas[i]["delta"] -= self._prevdeltas[i]["delta"]
+        
+        self._prevdeltas = self._prevdeltasnew.copy()
 
         delta_results: typing.List[EncodedResult] = []
         for delta in deltas:
@@ -471,7 +483,7 @@ class UDFContainer:
 
 
 class WSServer:
-    def __init__(self, detector_settings_file):
+    def __init__(self, detector_settings_file, acquisition_settings_file):
         self.ws_connected = set()
         self.parameters = ParameterContainer({
             'cx': 516/2.0,
@@ -480,6 +492,7 @@ class WSServer:
             'ro': 530.0,
         })
         self.detector_settings_file = detector_settings_file
+        self.acquisition_settings_file = acquisition_settings_file
         self.udfs = UDFContainer(self.get_udfs())
         self.sampler = ResultSampler(parameters=self.parameters, udfs=self.udfs)
         
@@ -500,21 +513,34 @@ class WSServer:
                 imageSizeY=516,
                 radius=ro,
                 radius_inner=ri)
-
-        mask_udf = SingleMaskUDF(mask_factories=[_ring])
-        return OrderedDict({
+        
+        with open(self.acquisition_settings_file, "rb") as f:
+            settings = tomllib.load(f)
+        
+        udf_dict = OrderedDict({
             # "brightfield": SumSigUDF(),
-            "annular": mask_udf,
+            # "segmented": SumSigSegUDF(N_x= 10),
+            # "annular": mask_udf,
             # "annular1": mask_udf,
             # "annular2": mask_udf,
             # "annular3": mask_udf,
             # "annular4": mask_udf,
             # "sum": SumUDF(),
             # "monitor": SignalMonitorUDF(),
-            "monitor_partition": PartitionMonitorUDF(),
+            # "monitor_partition": PartitionMonitorUDF(),
             # "icom": ICoMUDF.with_params(cx=cx, cy=cy, r=ro, flip_y=True),
-            "com": CoMUDF.with_params(cx=cx, cy=cy, r=ro, flip_y=True, regression=1),
+            # "com": CoMUDF.with_params(cx=cx, cy=cy, r=ro, flip_y=True, regression=1),
         })
+
+        if "brightfield" in settings["udfs"]:
+            udf_dict["brightfield"] = SumSigUDF()
+        if "segmented_brightfield" in settings["udfs"]:
+            udf_dict["segmented"] =  SumSigSegUDF(N_x= settings.get("n_segments", 0))
+        if "center_of_mass" in settings["udfs"]:
+            udf_dict["com"] = CoMUDF.with_params(cx=cx, cy=cy, r=ro, flip_y=True, regression=1)
+
+        mask_udf = SingleMaskUDF(mask_factories=[_ring])
+        return udf_dict
 
     async def __call__(self, websocket: WebSocketServerProtocol):
         await self.client_loop(websocket)
@@ -581,14 +607,20 @@ class WSServer:
                 num_updates = 0
                 partial_results = None
 
-                side = int(math.sqrt(pending_aq.nimages))
+                with open(self.acquisition_settings_file, "rb") as f:
+                    settings = tomllib.load(f)
+                if "size_x" in settings and "size_y" in settings:
+                    nav_shape = (settings["size_y"], settings["size_x"])
+                else:
+                    side = int(math.sqrt(pending_aq.nimages))
+                    nav_shape = (side, side)
 
                 aq = self.ctx.make_acquisition(
                     conn=self.conn,
                     pending_aq=pending_aq,
                     # frames_per_partition=10 * int(2/3 * side),
-                    frames_per_partition=1 * side,
-                    nav_shape=(side, side),
+                    frames_per_partition=1 * nav_shape[1],
+                    nav_shape=nav_shape,
                 )
                 part_res_iter = None
                 try:
@@ -661,18 +693,19 @@ class WSServer:
         log.info("live server connected and ready")
 
 
-async def main(detector_settings_file):
+async def main(detector_settings_file, acquisition_settings_file):
     log.info("live server starting up...")
-    server = WSServer(detector_settings_file=detector_settings_file)
+    server = WSServer(detector_settings_file=detector_settings_file, acquisition_settings_file=acquisition_settings_file)
     await server.serve()
 
 
 @click.command()
-@click.argument("detector_settings_file", type=str)
-def cli(detector_settings_file):
+@click.argument("detector_settings_file", type=str, default="prototypes/merlin.toml")
+@click.argument("acquisition_settings_file", type=str, default="prototypes/acquisition_parameters_STEM-DPC.toml")
+def cli(detector_settings_file, acquisition_settings_file):
     maybe_setup_tracing(service_name="libertem-live-server")
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(main(detector_settings_file))
+    asyncio.run(main(detector_settings_file, acquisition_settings_file))
 
 
 if __name__ == "__main__":
