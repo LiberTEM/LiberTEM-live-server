@@ -7,7 +7,6 @@ demonstrate that widget interactivity is feasible).
 """
 
 
-import sys
 import logging
 import time
 import json
@@ -22,12 +21,14 @@ import numpy as np
 import numba
 import bitshuffle
 import websockets
-from panta_rhei.scripting import PRScriptingInterface, PRScriptingTypes
-from panta_rhei.scripting.scripting_interface import ScriptDataModel
+import rerun as rr
 from result_codecs import LossyU16, BsLz4
 
 
 log = logging.getLogger(__name__)
+
+rr.init("live server demo")
+rr.spawn()
 
 
 class ResultItem(TypedDict):
@@ -77,8 +78,6 @@ class Plotter:
         self.todo_event = todo_event
         self._widget = None
         self._vd_params = None
-        self.data_models: Dict[str, ScriptDataModel] = {}
-        self.si = PRScriptingInterface()
         self._params_queue = params_queue
 
     def loop(self):
@@ -103,64 +102,15 @@ class Plotter:
                     arr = self.state.composed_data[key]
                     # arr = self.state.data[key]
                     mask = self.state.valid_masks[key]
-                    self.si.data_to_repo(key, arr)
+                    rr.log(key, rr.Image(arr))
 
-                if key not in self.data_models:
-                    model = self.data_models[key] = self.si.display_image(key)
-                    # XXX: hacks - always put the virtual detector widget into
-                    # the monitor partition UDF result display:
-                    if key == "monitor_partition-intensity":
-                        virtual_detector = model.insert(
-                            PRScriptingTypes.VirtualDetector
-                        )
-                        self._widget = virtual_detector
-                    print(f"data model: {self.data_models[key]}")
-
-                self.update_display_control(key, mask)
             t1 = time.time()
             if len(keys) > 0:
                 # print(f"plot updates: {t1-t0:.2f}s")
                 pass
 
-    def update_display_control(self, key: str, mask: np.ndarray):
-        if key not in self.data_models:
-            return
-        if True:
-            with self.state.data_lock:
-                mask &= self.state.data[key] != 0
-                # XXX hacks...
-                # very simple "outlier removal" specifically for getting rid of
-                # the INT_MAX stuff that dectris does for bad pixels:
-                try:
-                    mask = mask & (self.state.data[key] != np.max(self.state.data[key][mask]))
-                except ValueError:
-                    pass  # meh...
-
-                valid_data = self.state.data[key][mask].copy()
-            if len(valid_data) > 0:
-                vmin = np.min(valid_data)
-                vmax = np.max(valid_data)
-                model = self.data_models[key]
-                dc = model.get_display_control()
-                params = dc.get_parameters()
-                params['levels'] = [vmin, vmax]
-                params['auto_contrast'] = False
-                # params['color_map'] = 'temperature'
-                dc.set_parameters(params)
-
     def update_params(self):
-        if self._widget is None:
-            return None
-        params = self._widget.get_parameters(scale_mode='pixel')
-        new_params = {
-            'ri': params['inner'],
-            'ro': params['outer'],
-            'cx': params['center'][0],
-            'cy': params['center'][1],
-        }
-        if self._vd_params != new_params:
-            self._vd_params = new_params
-            self._params_queue.put(new_params)
+        return None
 
     def get_vd_params(self):
         return self._vd_params

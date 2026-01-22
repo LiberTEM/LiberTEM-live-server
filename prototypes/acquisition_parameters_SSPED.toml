@@ -1,5 +1,5 @@
 udfs = ["segmented_brightfield", "brightfield"]
 
-n_segments = 10
-size_x = 2560 # Including segments
-size_y = 512
+n_segments = 4
+size_x = 128 # Including segments
+size_y = 128
