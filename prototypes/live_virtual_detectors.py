@@ -81,6 +81,8 @@ class Plotter:
         self._params_queue = params_queue
 
     def loop(self):
+        # Make sure we update immediately with the first result
+        t0 = -np.inf
         # update as fast as possible, always using the most up-to-date state:
         while True:
             # self.todo_event.wait()
@@ -95,19 +97,20 @@ class Plotter:
                 # XXX what if the other thread called `set` again just before this?
                 # we might skip an update if we are unlucky?
                 self.todo_event.clear()
+            now = time.time()
+            if now - t0 > 1:
+                t0 = now
+                for key in keys:
+                    with self.state.data_lock:
+                        arr = self.state.composed_data[key]
+                        # arr = self.state.data[key]
+                        mask = self.state.valid_masks[key]
+                        rr.log(key, rr.Image(arr))
 
-            t0 = time.time()
-            for key in keys:
-                with self.state.data_lock:
-                    arr = self.state.composed_data[key]
-                    # arr = self.state.data[key]
-                    mask = self.state.valid_masks[key]
-                    rr.log(key, rr.Image(arr))
-
-            t1 = time.time()
-            if len(keys) > 0:
-                # print(f"plot updates: {t1-t0:.2f}s")
-                pass
+                t1 = time.time()
+                if len(keys) > 0:
+                    # print(f"plot updates: {t1-t0:.2f}s")
+                    pass
 
     def update_params(self):
         return None
