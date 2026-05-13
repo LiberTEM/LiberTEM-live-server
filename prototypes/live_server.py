@@ -41,16 +41,7 @@ from libertem.common.async_utils import sync_to_async
 # from libertem_icom.udf.icom import ICoMUDF
 from libertem.udf.com import CoMUDF
 
-from result_codecs import BsLz4, LossyU16
-
-
 log = logging.getLogger(__name__)
-
-
-@enum.unique
-class Encoding(enum.StrEnum):
-    DeltaBsLZ4 = "bslz4"
-    LossyU16 = "lossy-u16-bslz4"
 
 
 T = typing.TypeVar('T')
@@ -59,28 +50,25 @@ T = typing.TypeVar('T')
 class EncodedResult:
     def __init__(
         self,
-        compressed_data: memoryview,
-        bbox: typing.Tuple[int, int, int, int],
-        full_shape: typing.Tuple[int, int],
-        delta_shape: typing.Tuple[int, int],
+        data: np.ndarray,
+        damage: np.ndarray,
+        shape: tuple[int, int],
         dtype: str,
-        encoding: str,
-        encoding_meta: Dict[str, Any],
         channel_name: str,
         udf_name: str,
     ):
-        self.compressed_data = compressed_data
-        self.bbox = bbox
-        self.full_shape = full_shape
-        self.delta_shape = delta_shape
+        if not data.flags.c_contiguous:
+            data = np.copy(data)
+
+        if not damage.flags.c_contiguous:
+            damage = np.copy(damage)
+
+        self.data = data
+        self.damage = damage
+        self.shape = shape
         self.dtype = dtype
         self.channel_name = channel_name
         self.udf_name = udf_name
-        self.encoding = encoding
-        self.encoding_meta = encoding_meta
-
-    def is_empty(self):
-        return len(self.compressed_data) == 0
 
 
 class Closed(Exception):
@@ -232,88 +220,6 @@ class ResultSampler:
         #         client=websocket,
         #     )
 
-    async def make_deltas(
-        self, partial_results: UDFResults, previous_results: typing.Optional[UDFResults]
-    ) -> np.ndarray:
-        deltas = []
-        udf_names = list(self._udfs.get_udfs().keys())
-        for idx in range(len(partial_results.buffers)):
-            udf_name = udf_names[idx]
-            for channel_name in partial_results.buffers[idx].keys():
-                data = partial_results.buffers[idx][channel_name].data
-                # filter out non-2d result channels:
-                if len(data.shape) != 2:
-                    continue
-                if previous_results is None:
-                    data_previous = np.zeros_like(data)
-                else:
-                    data_previous = previous_results.buffers[idx][channel_name].data
-
-                delta = data - data_previous
-                deltas.append({
-                    'delta': delta,
-                    'udf_name': udf_name,
-                    'channel_name': channel_name,
-                })
-        return deltas
-
-    async def encode_result(
-        self, delta: np.ndarray, udf_name: str, channel_name: str
-    ) -> EncodedResult:
-        """
-        Slice `delta` to its non-zero region and compress that. Returns the information
-        needed to reconstruct the the full result.
-        """
-        loop = asyncio.get_running_loop()
-        nonzero_mask = await loop.run_in_executor(None, lambda: ~np.isclose(0, delta))
-
-        if np.count_nonzero(nonzero_mask) == 0:
-            log.debug("zero-delta update, skipping")
-            # skip this update if it is all-zero
-            return EncodedResult(
-                compressed_data=memoryview(b""),
-                bbox=(0, 0, 0, 0),
-                full_shape=delta.shape,
-                delta_shape=(0, 0),
-                dtype=delta.dtype,
-                channel_name=channel_name,
-                udf_name=udf_name,
-                encoding=Encoding.DeltaBsLZ4,
-                encoding_meta={
-                    "shape": (0, 0),
-                    "dtype": "uint8",
-                },
-            )
-
-        bbox = get_bbox(delta)
-        ymin, ymax, xmin, xmax = bbox
-        delta_for_blit = delta[ymin:ymax + 1, xmin:xmax + 1]
-
-        # FIXME: lossy/lossless selection in UDF somehow? be smart about it? for large bboxes?
-        # or for large updates byte-wise?
-        if delta.dtype.kind == 'f' and delta_for_blit.nbytes > 1024*64:
-            encoding = Encoding.LossyU16
-            codec = LossyU16()
-            log.debug(f"encoding channel {channel_name} of udf {udf_name} as lossy")
-        else:
-            encoding = Encoding.DeltaBsLZ4
-            codec = BsLz4()
-        compressed, encoding_meta = await sync_to_async(lambda: codec.encode(delta_for_blit))
-
-        log.debug("encode_result: bbox=%r", bbox)
-
-        return EncodedResult(
-            compressed_data=memoryview(compressed),
-            bbox=bbox,
-            full_shape=delta.shape,
-            delta_shape=delta_for_blit.shape,
-            dtype=delta.dtype,
-            channel_name=channel_name,
-            udf_name=udf_name,
-            encoding=encoding,
-            encoding_meta=encoding_meta,
-        )
-
     async def handle_partial_result(
         self,
         client: WebSocketClientProtocol,
@@ -321,52 +227,43 @@ class ResultSampler:
         partial_results: UDFResults,
         acq_id: str,
     ):
-        previous_results = None
-        deltas = await self.make_deltas(partial_results, previous_results)
-        self._prevdeltasnew = []
-        for i in range(len(deltas)):
-            self._prevdeltasnew.append(deltas[i].copy())
-            self._prevdeltasnew[-1]["delta"] = deltas[i]["delta"].copy()
-
-        if hasattr(self, "_prevdeltas"):
-            for i in range(len(deltas)):
-                deltas[i]["delta"] -= self._prevdeltas[i]["delta"]
-        
-        self._prevdeltas = self._prevdeltasnew.copy()
-
-        delta_results: typing.List[EncodedResult] = []
-        for delta in deltas:
-            delta_results.append(
-                await self.encode_result(
-                    delta['delta'],
-                    delta['udf_name'],
-                    delta['channel_name']
-                )
+        channels = [
+            EncodedResult(
+                data=channel_buffer.data,
+                damage=partial_results.damage.data,
+                shape=channel_buffer.data.shape,
+                dtype=channel_buffer.data.dtype,
+                channel_name=channel_name,
+                udf_name=udf_name,
             )
+            for udf_name, result in zip(
+                self._udfs.get_udfs().keys(),
+                partial_results.buffers
+            )
+            for channel_name, channel_buffer in result.items()
+        ]
         header_msg = json.dumps({
             "event": "RESULT",
             "id": acq_id,
             "timestamp": time.time(),
             "channels": [
                 {
-                    "bbox": result.bbox,
-                    "full_shape": result.full_shape,
-                    "delta_shape": result.delta_shape,
+                    "shape": result.shape,
+                    "damage_shape": result.damage.shape,
                     "dtype": str(result.dtype),
-                    "encoding": result.encoding,
-                    "encoding_meta": result.encoding_meta,
                     "channel_name": result.channel_name,
                     "udf_name": result.udf_name,
                 }
-                for result in delta_results
+                for result in channels
             ],
         }, indent=4)
 
         # log.info("header_msg: %s", header_msg)
 
         await client.send(header_msg)
-        for result in delta_results:
-            await client.send(result.compressed_data)
+        for result in channels:
+            await client.send(result.data.tobytes())
+            await client.send(result.damage.data.tobytes())
 
     async def sampler_loop(self, client: WebSocketClientProtocol):
         """
@@ -416,7 +313,7 @@ class ResultSampler:
 
 
 @numba.njit(cache=True)
-def get_bbox(arr) -> typing.Tuple[int, ...]:
+def get_bbox(arr) -> tuple[int, ...]:
     xmin = arr.shape[1]
     ymin = arr.shape[0]
     xmax = 0
@@ -614,6 +511,7 @@ class WSServer:
                 else:
                     side = int(math.sqrt(pending_aq.nimages))
                     nav_shape = (side, side)
+                    print(nav_shape)
 
                 aq = self.ctx.make_acquisition(
                     conn=self.conn,
