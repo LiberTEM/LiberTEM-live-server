@@ -140,52 +140,65 @@ class RecvThread(threading.Thread):
         super().__init__()
 
     async def main(self):
-        async with websockets.connect(
-            self.url, max_size=16*1024*1024,
-        ) as websocket:
-            last_msg = None
-
+        while True:
             try:
-                while True:
-                    msg = await websocket.recv()
-                    decoded_msg = json.loads(msg)
-                    last_msg = decoded_msg
+                async with websockets.connect(
+                    self.url, max_size=16*1024*1024,
+                ) as websocket:
+                    last_msg = None
 
-                    # print(decoded_msg)
-
-                    event = decoded_msg['event']
-                    if event == "ACQUISITION_STARTED":
-                        print(f"acquisition started: {decoded_msg['id']}")
-                        self.state.acquisition_started(
-                            acq_id=decoded_msg['id']
-                        )
-                    elif event == "ACQUISITION_ENDED":
-                        self.state.acquisition_ended(
-                            acq_id=decoded_msg['id']
-                        )
-                    elif event == "RESULT":
-                        delta = 0.0
-                        delta_apply = 0.0
-                        for chan in decoded_msg['channels']:
+                    try:
+                        while True:
                             msg = await websocket.recv()
-                            msg_damage = await websocket.recv()
-                            # print(f"binary message of length {len(msg)}")
-                            # print(chan)
-                            t0 = time.time()
-                            self.state.apply_result_item(
-                                acq_id=decoded_msg['id'],
-                                item=chan,
-                                compressed_data=msg,
-                                damage=msg_damage,
-                            )
-                            t1 = time.time()
-                            delta_apply += t1 - t0
-                        # print(f"decompression took {delta:.3f}s")
-                        # print(f"apply took {delta_apply:.3f}s")
-                    else:
-                        print(f"last msg: {last_msg}")
-            finally:
-                pass
+                            decoded_msg = json.loads(msg)
+                            last_msg = decoded_msg
+
+                            # print(decoded_msg)
+
+                            event = decoded_msg['event']
+                            if event == "ACQUISITION_STARTED":
+                                print(f"acquisition started: {decoded_msg['id']}")
+                                self.state.acquisition_started(
+                                    acq_id=decoded_msg['id']
+                                )
+                            elif event == "ACQUISITION_ENDED":
+                                self.state.acquisition_ended(
+                                    acq_id=decoded_msg['id']
+                                )
+                            elif event == "RESULT":
+                                delta = 0.0
+                                delta_apply = 0.0
+                                for chan in decoded_msg['channels']:
+                                    msg = await websocket.recv()
+                                    msg_damage = await websocket.recv()
+                                    # print(f"binary message of length {len(msg)}")
+                                    # print(chan)
+                                    t0 = time.time()
+                                    self.state.apply_result_item(
+                                        acq_id=decoded_msg['id'],
+                                        item=chan,
+                                        compressed_data=msg,
+                                        damage=msg_damage,
+                                    )
+                                    t1 = time.time()
+                                    delta_apply += t1 - t0
+                                # print(f"decompression took {delta:.3f}s")
+                                # print(f"apply took {delta_apply:.3f}s")
+                            else:
+                                print(f"last msg: {last_msg}")
+                    finally:
+                        pass
+            except OSError as e:
+                # For some reason e.errno is not set, message says sth about multiple exceptions (?)
+                # 111 is connection refused
+                if "111" in str(e):
+                    # reconnect
+                    print("Trying to reconnect...")
+                    time.sleep(1)
+                    break
+                else:
+                    raise
+
 
     async def restart_loop(self):
         while True:
