@@ -1,0 +1,8 @@
+libertem-live
+libertem
+numpy
+numba
+click
+websockets
+typing-extensions
+rerun
