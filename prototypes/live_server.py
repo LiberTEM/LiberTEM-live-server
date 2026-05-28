@@ -392,6 +392,7 @@ class WSServer:
         self.acquisition_settings_file = acquisition_settings_file
         self.udfs = UDFContainer(self.get_udfs())
         self.sampler = ResultSampler(parameters=self.parameters, udfs=self.udfs)
+        self.client_connected = asyncio.Event()
         
         self.connect()
 
@@ -454,6 +455,7 @@ class WSServer:
         try:
             try:
                 await self.register_client(websocket)
+                self.client_connected.set()
                 async for msg in websocket:
                     await self.handle_message(msg, websocket)
             except websockets.exceptions.ConnectionClosedError:
@@ -493,6 +495,7 @@ class WSServer:
         }))
 
     async def acquisition_loop(self):
+        await self.client_connected.wait()
         while True:
             pending_aq = await sync_to_async(self.conn.wait_for_acquisition, timeout=10)
             if pending_aq is None:
