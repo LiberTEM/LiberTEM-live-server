@@ -6,12 +6,13 @@ UDFs (this is a limitation that can be lifted in production, this is only to
 demonstrate that widget interactivity is feasible).
 """
 
-
+import sys
 import logging
 import time
 import json
 import asyncio
 import threading
+import warnings
 from typing_extensions import TypedDict
 
 import click
@@ -22,9 +23,6 @@ from libertem.viz.base import visualize_simple
 
 
 log = logging.getLogger(__name__)
-
-rr.init("live server demo")
-rr.spawn()
 
 
 class ResultItem(TypedDict):
@@ -84,6 +82,9 @@ class Plotter:
                     with self.state.data_lock:
                         arr = self.state.data[key]
                         damage = self.state.valid_masks[key]
+                        # FIXME no idea why the damage shape is wrong some times
+                        if damage is not None and damage.shape != arr.shape:
+                            damage = None
                         if len(arr.shape) == 2:
                             viz = visualize_simple(arr, damage=damage)
 
@@ -117,16 +118,22 @@ class State:
         compressed_data: bytes,
         damage: bytes,
     ):
-        new_arr = np.frombuffer(compressed_data, dtype=item['dtype'])
-        new_arr = new_arr.reshape(item['shape'])
-        damage_arr = np.frombuffer(damage, dtype=bool).reshape(item['damage_shape'])
-        with self.data_lock:
-            self._gen_counter += 1
-            key = f"{item['udf_name']}-{item['channel_name']}"
-            self.data[key] = new_arr
-            self.valid_masks[key] = damage_arr
-            print(key, new_arr.shape, damage_arr.shape)
-        self._todo_event.set()
+        # For some reason one may get shape mismatch or invalid types?
+        try:
+            new_arr = np.frombuffer(compressed_data, dtype=item['dtype'])
+            new_arr = new_arr.reshape(item['shape'])
+            damage_arr = np.frombuffer(damage, dtype=bool).reshape(item['damage_shape'])
+        except Exception as e:
+            warnings.warn(str(e))
+            damage_arr = None
+            new_arr = None
+        if new_arr is not None:
+            with self.data_lock:
+                self._gen_counter += 1
+                key = f"{item['udf_name']}-{item['channel_name']}"
+                self.data[key] = new_arr
+                self.valid_masks[key] = damage_arr
+            self._todo_event.set()
 
     def acquisition_started(self, acq_id: str):
         pass
@@ -156,42 +163,45 @@ class RecvThread(threading.Thread):
                     try:
                         while True:
                             msg = await websocket.recv()
-                            decoded_msg = json.loads(msg)
-                            last_msg = decoded_msg
+                            try:
+                                decoded_msg = json.loads(msg)
+                                last_msg = decoded_msg
 
-                            # print(decoded_msg)
+                                # print(decoded_msg)
 
-                            event = decoded_msg['event']
-                            if event == "ACQUISITION_STARTED":
-                                print(f"acquisition started: {decoded_msg['id']}")
-                                self.state.acquisition_started(
-                                    acq_id=decoded_msg['id']
-                                )
-                            elif event == "ACQUISITION_ENDED":
-                                self.state.acquisition_ended(
-                                    acq_id=decoded_msg['id']
-                                )
-                            elif event == "RESULT":
-                                delta = 0.0
-                                delta_apply = 0.0
-                                for chan in decoded_msg['channels']:
-                                    msg = await websocket.recv()
-                                    msg_damage = await websocket.recv()
-                                    # print(f"binary message of length {len(msg)}")
-                                    # print(chan)
-                                    t0 = time.time()
-                                    self.state.apply_result_item(
-                                        acq_id=decoded_msg['id'],
-                                        item=chan,
-                                        compressed_data=msg,
-                                        damage=msg_damage,
+                                event = decoded_msg['event']
+                                if event == "ACQUISITION_STARTED":
+                                    print(f"acquisition started: {decoded_msg['id']}")
+                                    self.state.acquisition_started(
+                                        acq_id=decoded_msg['id']
                                     )
-                                    t1 = time.time()
-                                    delta_apply += t1 - t0
-                                # print(f"decompression took {delta:.3f}s")
-                                # print(f"apply took {delta_apply:.3f}s")
-                            else:
-                                print(f"last msg: {last_msg}")
+                                elif event == "ACQUISITION_ENDED":
+                                    self.state.acquisition_ended(
+                                        acq_id=decoded_msg['id']
+                                    )
+                                elif event == "RESULT":
+                                    delta = 0.0
+                                    delta_apply = 0.0
+                                    for chan in decoded_msg['channels']:
+                                        msg = await websocket.recv()
+                                        msg_damage = await websocket.recv()
+                                        # print(f"binary message of length {len(msg)}")
+                                        # print(chan)
+                                        t0 = time.time()
+                                        self.state.apply_result_item(
+                                            acq_id=decoded_msg['id'],
+                                            item=chan,
+                                            compressed_data=msg,
+                                            damage=msg_damage,
+                                        )
+                                        t1 = time.time()
+                                        delta_apply += t1 - t0
+                                    # print(f"decompression took {delta:.3f}s")
+                                    # print(f"apply took {delta_apply:.3f}s")
+                                else:
+                                    print(f"last msg: {last_msg}")
+                            except json.JSONDecodeError as e:
+                                warnings.warn(msg.decode('utf8') + str(e))
                     finally:
                         pass
             except OSError as e:
@@ -221,7 +231,11 @@ class RecvThread(threading.Thread):
 
 @click.command()
 @click.option('--url', type=str, default='ws://localhost:8444')
-def main(url):
+@click.argument('name', default='live server demo')
+def main(url, name):
+    rr.init(name)
+    rr.spawn()
+
     todo = threading.Event()
     state = State(todo_event=todo)
 

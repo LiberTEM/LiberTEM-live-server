@@ -5,4 +5,4 @@ numba
 click
 websockets
 typing-extensions
-rerun
+rerun-sdk
