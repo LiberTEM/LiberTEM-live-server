@@ -429,7 +429,6 @@ class WSServer:
             # "icom": ICoMUDF.with_params(cx=cx, cy=cy, r=ro, flip_y=True),
             # "com": CoMUDF.with_params(cx=cx, cy=cy, r=ro, flip_y=True, regression=1),
         })
-
         if "brightfield" in settings["udfs"]:
             udf_dict["brightfield"] = SumSigUDF()
         if "segmented_brightfield" in settings["udfs"]:
