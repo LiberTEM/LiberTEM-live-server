@@ -18,6 +18,7 @@ import click
 import numpy as np
 import websockets
 import rerun as rr
+from libertem.viz.base import visualize_simple
 
 
 log = logging.getLogger(__name__)
@@ -82,8 +83,11 @@ class Plotter:
                 for key in keys:
                     with self.state.data_lock:
                         arr = self.state.data[key]
+                        damage = self.state.valid_masks[key]
                         if len(arr.shape) == 2:
-                            rr.log(key, rr.Image(arr))
+                            viz = visualize_simple(arr, damage=damage)
+
+                            rr.log(key, rr.Image(viz, color_model='RGBA'))
 
                 t1 = time.time()
                 if len(keys) > 0:
@@ -120,6 +124,8 @@ class State:
             self._gen_counter += 1
             key = f"{item['udf_name']}-{item['channel_name']}"
             self.data[key] = new_arr
+            self.valid_masks[key] = damage_arr
+            print(key, new_arr.shape, damage_arr.shape)
         self._todo_event.set()
 
     def acquisition_started(self, acq_id: str):

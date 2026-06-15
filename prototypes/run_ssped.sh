@@ -8,4 +8,4 @@ trap 'trap - SIGTERM && kill -- -$$ && kill $(jobs -p)' SIGINT SIGTERM EXIT
 
 python live_server.py merlin.toml acquisition_parameters_SSPED.toml &
 python live_virtual_detectors.py &
-libertem-live-mib-sim --dwelltime 300 --cached=MEM ~/er-c-data-Nextcloud/ER-C-Data/adhoc/libertem/libertem-test-data/20200518\ 165148/default.hdr
+libertem-live-mib-sim ~/er-c-data/adhoc/livespedescan/SSPED/SPED_256x256_22x22_10186nm_NBD_a5_spot1nm_CL20cm_125msExp_3000msFB_subframing_x8_pivotoff_01/default.hdr
