@@ -1,50 +1,54 @@
 import os
-os.environ['OMP_NUM_THREADS'] = '1'  # must come before numba (because of OMP stuff?)
 
-import time
-import json
+os.environ["OMP_NUM_THREADS"] = "1"  # must come before numba (because of OMP stuff?)
+
 import asyncio
-import typing
-from typing import Coroutine, Dict, Any, Set, Tuple, Callable, AsyncGenerator
-from collections import OrderedDict
-from contextlib import asynccontextmanager
-import math
+import json
 import logging
-import enum
-import copy
+import math
+import time
+import typing
+import uuid
+from collections import OrderedDict
+from collections.abc import AsyncGenerator, Callable, Coroutine
+from contextlib import asynccontextmanager
+from typing import Any
 
+import click
 import numba
 import numpy as np
-import uuid
-import websockets
-import click
 import tomllib
-
-from websockets.legacy.server import WebSocketServerProtocol
-from websockets.legacy.client import WebSocketClientProtocol
+import websockets
 
 from libertem import masks
-from libertem.udf import UDF
-from libertem.udf.sum import SumUDF
-from libertem.udf.sumsigudf import SumSigUDF
-from sumsigsegudf import SumSigSegUDF
-from libertem.udf.masks import ApplyMasksUDF
-from libertem.executor.pipelined import PipelinedExecutor
-from libertem_live.api import LiveContext
-from libertem_live.udf.monitor import (
-    PartitionMonitorUDF
-)
-from libertem.common.tracing import maybe_setup_tracing
-
-from libertem.udf.base import UDFResults
 from libertem.common.async_utils import sync_to_async
+from libertem.common.tracing import maybe_setup_tracing
+from libertem.executor.pipelined import PipelinedExecutor
+from libertem.udf import UDF
+from libertem.udf.base import UDFResults
+
 # from libertem_icom.udf.icom import ICoMUDF
 from libertem.udf.com import CoMUDF
+from libertem.udf.masks import ApplyMasksUDF
+from libertem.udf.sumsigudf import SumSigUDF
+from libertem_live.api import LiveContext
+from websockets.legacy.client import WebSocketClientProtocol
+from websockets.legacy.server import WebSocketServerProtocol
+
+from sumsigsegudf import SumSigSegUDF
 
 log = logging.getLogger(__name__)
 
 
-T = typing.TypeVar('T')
+T = typing.TypeVar("T")
+
+
+async def load_toml_async(file_path: str) -> dict:
+    def _parse():
+        with open(file_path, "rb") as f:
+            return tomllib.load(f)
+
+    return await asyncio.to_thread(_parse)
 
 
 class EncodedResult:
@@ -83,7 +87,7 @@ class LatestContainer(typing.Generic[T]):
     """
 
     def __init__(self) -> None:
-        self._item: typing.Optional[T] = None
+        self._item: T | None = None
         self._cond = asyncio.Condition()
         self._closed = False
 
@@ -137,26 +141,26 @@ class ResultSampler:
     and starts per-client loops that send out results as fast as
     the client can handle.
     """
+
     def __init__(self, parameters: "ParameterContainer", udfs: "UDFContainer"):
-        self.clients: Set[WebSocketClientProtocol] = set()
-        self.client_queues: Dict[
+        self.clients: set[WebSocketClientProtocol] = set()
+        self.client_queues: dict[
             WebSocketClientProtocol,
-            asyncio.Queue[Tuple[str, LatestContainer[UDFResults]]]
+            asyncio.Queue[tuple[str, LatestContainer[UDFResults]]],
         ] = {}
-        self._sampler_tasks: Dict[WebSocketClientProtocol, asyncio.Task] = {}
-        self._min_delta = 1/60.0  # should this be a parameter?
+        self._sampler_tasks: dict[WebSocketClientProtocol, asyncio.Task] = {}
+        self._min_delta = 1 / 60.0  # should this be a parameter?
         self._parameters = parameters
         self._udfs = udfs
 
     @asynccontextmanager
-    async def handle_acquisition(self, acq_id: str) -> AsyncGenerator[
-        Callable[[UDFResults], Coroutine[None, None, None]], None
-    ]:
+    async def handle_acquisition(
+        self, acq_id: str
+    ) -> AsyncGenerator[Callable[[UDFResults], Coroutine[None, None, None]], None]:
         # inform all our per-client sampler loops that a new acquisition was started,
         # and give them access to a new `LatestContainer`
-        to_clients: Dict[WebSocketClientProtocol, LatestContainer] = {
-            client: LatestContainer()
-            for client in self.clients
+        to_clients: dict[WebSocketClientProtocol, LatestContainer] = {
+            client: LatestContainer() for client in self.clients
         }
         for client, lc in to_clients.items():
             log.info("sending some LCs to sampler loops...")
@@ -171,10 +175,11 @@ class ResultSampler:
             if False:
                 # XXX
                 import cloudpickle
+
                 a = cloudpickle.dumps(result_copy)
                 print(len(a))
-            for client in to_clients:
-                await to_clients[client].put(result_copy)
+            for container in to_clients.values():
+                await container.put(result_copy)
                 await self._check_task_status()
 
         yield _result_sink
@@ -182,7 +187,7 @@ class ResultSampler:
             await lc.close()
 
     async def _check_task_status(self):
-        for client, task in self._sampler_tasks.items():
+        for task in self._sampler_tasks.values():
             if task.done():
                 exc = task.exception()
                 if exc is not None:
@@ -207,10 +212,14 @@ class ResultSampler:
         task.cancel()
 
     async def send_initial(self, websocket: WebSocketClientProtocol):
-        await websocket.send(json.dumps({
-            'event': 'UPDATE_PARAMS',
-            'parameters': self._parameters.get_parameters(),
-        }))
+        await websocket.send(
+            json.dumps(
+                {
+                    "event": "UPDATE_PARAMS",
+                    "parameters": self._parameters.get_parameters(),
+                }
+            )
+        )
         # for acq_id in self.results.keys():
         #     result = self.results.get_result(acq_id)
         #     await self.handle_partial_result(
@@ -223,7 +232,7 @@ class ResultSampler:
     async def handle_partial_result(
         self,
         client: WebSocketClientProtocol,
-        previous_results: typing.Optional[UDFResults],
+        previous_results: UDFResults | None,
         partial_results: UDFResults,
         acq_id: str,
     ):
@@ -237,26 +246,28 @@ class ResultSampler:
                 udf_name=udf_name,
             )
             for udf_name, result in zip(
-                self._udfs.get_udfs().keys(),
-                partial_results.buffers
+                self._udfs.get_udfs().keys(), partial_results.buffers
             )
             for channel_name, channel_buffer in result.items()
         ]
-        header_msg = json.dumps({
-            "event": "RESULT",
-            "id": acq_id,
-            "timestamp": time.time(),
-            "channels": [
-                {
-                    "shape": result.shape,
-                    "damage_shape": result.damage.shape,
-                    "dtype": str(result.dtype),
-                    "channel_name": result.channel_name,
-                    "udf_name": result.udf_name,
-                }
-                for result in channels
-            ],
-        }, indent=4)
+        header_msg = json.dumps(
+            {
+                "event": "RESULT",
+                "id": acq_id,
+                "timestamp": time.time(),
+                "channels": [
+                    {
+                        "shape": result.shape,
+                        "damage_shape": result.damage.shape,
+                        "dtype": str(result.dtype),
+                        "channel_name": result.channel_name,
+                        "udf_name": result.udf_name,
+                    }
+                    for result in channels
+                ],
+            },
+            indent=4,
+        )
 
         # log.info("header_msg: %s", header_msg)
 
@@ -325,14 +336,10 @@ def get_bbox(arr) -> tuple[int, ...]:
             if abs(value) < 1e-8:
                 continue
             # got a non-zero value, update indices
-            if x < xmin:
-                xmin = x
-            if x > xmax:
-                xmax = x
-            if y < ymin:
-                ymin = y
-            if y > ymax:
-                ymax = y
+            xmin = min(xmin, x)
+            xmax = max(xmax, x)
+            ymin = min(ymin, y)
+            ymax = max(ymax, y)
     return int(ymin), int(ymax), int(xmin), int(xmax)
 
 
@@ -340,11 +347,19 @@ class SingleMaskUDF(ApplyMasksUDF):
     def get_result_buffers(self):
         dtype = np.result_type(self.meta.input_dtype, self.get_mask_dtype())
         return {
-            'intensity': self.buffer(
-                kind='nav', extra_shape=(1,), dtype=dtype, where='device', use='internal',
+            "intensity": self.buffer(
+                kind="nav",
+                extra_shape=(1,),
+                dtype=dtype,
+                where="device",
+                use="internal",
             ),
-            'intensity_nav': self.buffer(
-                kind='nav', extra_shape=(), dtype=dtype, where='device', use='result',
+            "intensity_nav": self.buffer(
+                kind="nav",
+                extra_shape=(),
+                dtype=dtype,
+                where="device",
+                use="result",
             ),
         }
 
@@ -353,18 +368,20 @@ class SingleMaskUDF(ApplyMasksUDF):
         # will override our desired shape. so we have to use two result buffers
         # instead:
         return {
-            'intensity_nav': self.results.intensity.reshape(self.meta.dataset_shape.nav),
+            "intensity_nav": self.results.intensity.reshape(
+                self.meta.dataset_shape.nav
+            ),
         }
 
 
 class ParameterContainer:
-    def __init__(self, parameters: Dict[str, Any]):
+    def __init__(self, parameters: dict[str, Any]):
         self.parameters = parameters
 
-    def set_parameters(self, parameters: Dict[str, Any]):
+    def set_parameters(self, parameters: dict[str, Any]):
         self.parameters = parameters
 
-    def get_parameters(self) -> Dict[str, Any]:
+    def get_parameters(self) -> dict[str, Any]:
         return self.parameters
 
 
@@ -382,26 +399,28 @@ class UDFContainer:
 class WSServer:
     def __init__(self, detector_settings_file, acquisition_settings_file):
         self.ws_connected = set()
-        self.parameters = ParameterContainer({
-            'cx': 516/2.0,
-            'cy': 512/2.0,
-            'ri': 200.0,
-            'ro': 530.0,
-        })
+        self.parameters = ParameterContainer(
+            {
+                "cx": 516 / 2.0,
+                "cy": 512 / 2.0,
+                "ri": 200.0,
+                "ro": 530.0,
+            }
+        )
         self.detector_settings_file = detector_settings_file
         self.acquisition_settings_file = acquisition_settings_file
         self.udfs = UDFContainer(self.get_udfs())
         self.sampler = ResultSampler(parameters=self.parameters, udfs=self.udfs)
         self.client_connected = asyncio.Event()
-        
+
         self.connect()
 
     def get_udfs(self) -> OrderedDict[str, "UDF"]:
         parameters = self.parameters.get_parameters()
-        cx = parameters['cx']
-        cy = parameters['cy']
-        ri = parameters['ri']
-        ro = parameters['ro']
+        cx = parameters["cx"]
+        cy = parameters["cy"]
+        ri = parameters["ri"]
+        ro = parameters["ro"]
 
         def _ring():
             return masks.ring(
@@ -410,33 +429,38 @@ class WSServer:
                 imageSizeX=516,
                 imageSizeY=516,
                 radius=ro,
-                radius_inner=ri)
-        
+                radius_inner=ri,
+            )
+
         with open(self.acquisition_settings_file, "rb") as f:
             settings = tomllib.load(f)
-        
-        udf_dict = OrderedDict({
-            # "brightfield": SumSigUDF(),
-            # "segmented": SumSigSegUDF(N_x= 10),
-            # "annular": mask_udf,
-            # "annular1": mask_udf,
-            # "annular2": mask_udf,
-            # "annular3": mask_udf,
-            # "annular4": mask_udf,
-            # "sum": SumUDF(),
-            # "monitor": SignalMonitorUDF(),
-            # "monitor_partition": PartitionMonitorUDF(),
-            # "icom": ICoMUDF.with_params(cx=cx, cy=cy, r=ro, flip_y=True),
-            # "com": CoMUDF.with_params(cx=cx, cy=cy, r=ro, flip_y=True, regression=1),
-        })
+
+        udf_dict = OrderedDict(
+            {
+                # "brightfield": SumSigUDF(),
+                # "segmented": SumSigSegUDF(N_x= 10),
+                # "annular": mask_udf,
+                # "annular1": mask_udf,
+                # "annular2": mask_udf,
+                # "annular3": mask_udf,
+                # "annular4": mask_udf,
+                # "sum": SumUDF(),
+                # "monitor": SignalMonitorUDF(),
+                # "monitor_partition": PartitionMonitorUDF(),
+                # "icom": ICoMUDF.with_params(cx=cx, cy=cy, r=ro, flip_y=True),
+                # "com": CoMUDF.with_params(cx=cx, cy=cy, r=ro, flip_y=True, regression=1),
+            }
+        )
         if "brightfield" in settings["udfs"]:
             udf_dict["brightfield"] = SumSigUDF()
         if "segmented_brightfield" in settings["udfs"]:
-            udf_dict["segmented"] =  SumSigSegUDF(N_x= settings.get("n_segments", 0))
+            udf_dict["segmented"] = SumSigSegUDF(N_x=settings.get("n_segments", 0))
         if "center_of_mass" in settings["udfs"]:
-            udf_dict["com"] = CoMUDF.with_params(cx=cx, cy=cy, r=ro, flip_y=True, regression=1)
+            udf_dict["com"] = CoMUDF.with_params(
+                cx=cx, cy=cy, r=ro, flip_y=True, regression=1
+            )
 
-        mask_udf = SingleMaskUDF(mask_factories=[_ring])
+        SingleMaskUDF(mask_factories=[_ring])
         return udf_dict
 
     async def __call__(self, websocket: WebSocketServerProtocol):
@@ -466,32 +490,41 @@ class WSServer:
         try:
             msg = json.loads(msg)
             # FIXME: hack to not require the 'event' "tag":
-            if 'event' not in msg or msg['event'] == 'UPDATE_PARAMS':
+            if "event" not in msg or msg["event"] == "UPDATE_PARAMS":
                 print(f"parameter update: {msg}")
-                self.parameters.set_parameters(msg['parameters'])
+                self.parameters.set_parameters(msg["parameters"])
                 self.udfs.set_udfs(self.get_udfs())
                 # broadcast to all clients:
-                msg['event'] = 'UPDATE_PARAMS'
+                msg["event"] = "UPDATE_PARAMS"
                 await self.broadcast(json.dumps(msg))
         except Exception as e:
             print(e)
+            raise
 
     async def broadcast(self, msg):
         websockets.broadcast(self.ws_connected, msg)
 
     async def handle_pending_acquisition(self, pending) -> str:
         acq_id = str(uuid.uuid4())
-        await self.broadcast(json.dumps({
-            "event": "ACQUISITION_STARTED",
-            "id": acq_id,
-        }))
+        await self.broadcast(
+            json.dumps(
+                {
+                    "event": "ACQUISITION_STARTED",
+                    "id": acq_id,
+                }
+            )
+        )
         return acq_id
 
     async def handle_acquisition_end(self, pending, acq_id: str):
-        await self.broadcast(json.dumps({
-            "event": "ACQUISITION_ENDED",
-            "id": acq_id,
-        }))
+        await self.broadcast(
+            json.dumps(
+                {
+                    "event": "ACQUISITION_ENDED",
+                    "id": acq_id,
+                }
+            )
+        )
 
     async def acquisition_loop(self):
         await self.client_connected.wait()
@@ -505,9 +538,7 @@ class WSServer:
                 t0 = time.perf_counter()
                 num_updates = 0
                 partial_results = None
-
-                with open(self.acquisition_settings_file, "rb") as f:
-                    settings = tomllib.load(f)
+                settings = await load_toml_async(self.acquisition_settings_file)
                 if "size_x" in settings and "size_y" in settings:
                     nav_shape = (settings["size_y"], settings["size_x"])
                 else:
@@ -526,21 +557,28 @@ class WSServer:
                 try:
                     udfs_only = list(self.udfs.get_udfs().values())
                     params = [udf._kwargs for udf in udfs_only]
-                    part_res_iter = self.ctx.run_udf_iter(dataset=aq, udf=udfs_only, sync=False)
-                    async with self.sampler.handle_acquisition(acq_id=acq_id) as result_sink:
+                    part_res_iter = self.ctx.run_udf_iter(
+                        dataset=aq, udf=udfs_only, sync=False
+                    )
+                    async with self.sampler.handle_acquisition(
+                        acq_id=acq_id
+                    ) as result_sink:
                         async for partial_results in part_res_iter:
                             # parameter update:
                             udfs_only = list(self.udfs.get_udfs().values())
                             new_params = [udf._kwargs for udf in udfs_only]
                             if new_params != params:  # change detection
-                                await part_res_iter.update_parameters_experimental(new_params)
+                                await part_res_iter.update_parameters_experimental(
+                                    new_params
+                                )
                                 params = new_params
                             await result_sink(partial_results)
                             num_updates += 1
                         await result_sink(partial_results)
                         num_updates += 1
-                except Exception:
+                except Exception:  # noqa: BLE001
                     import traceback
+
                     traceback.print_exc()
                     if part_res_iter is not None:
                         await part_res_iter.aclose()
@@ -550,8 +588,10 @@ class WSServer:
             finally:
                 await self.handle_acquisition_end(pending_aq, acq_id)
             t1 = time.perf_counter()
-            print(f"acquisition done with id={acq_id}; "
-                  f"took {t1-t0:.3f}s; num_updates={num_updates}")
+            print(
+                f"acquisition done with id={acq_id}; "
+                f"took {t1 - t0:.3f}s; num_updates={num_updates}"
+            )
             num_updates = 0
 
     async def serve(self):
@@ -573,11 +613,9 @@ class WSServer:
 
     def connect(self):
         executor = PipelinedExecutor(
-            spec=PipelinedExecutor.make_spec(
-                cpus=range(3), cudas=[]
-            ),
+            spec=PipelinedExecutor.make_spec(cpus=range(3), cudas=[]),
             pin_workers=False,
-            startup_timeout=120
+            startup_timeout=120,
         )
         ctx = LiveContext(executor=executor)
 
@@ -595,13 +633,20 @@ class WSServer:
 
 async def main(detector_settings_file, acquisition_settings_file):
     log.info("live server starting up...")
-    server = WSServer(detector_settings_file=detector_settings_file, acquisition_settings_file=acquisition_settings_file)
+    server = WSServer(
+        detector_settings_file=detector_settings_file,
+        acquisition_settings_file=acquisition_settings_file,
+    )
     await server.serve()
 
 
 @click.command()
 @click.argument("detector_settings_file", type=str, default="prototypes/merlin.toml")
-@click.argument("acquisition_settings_file", type=str, default="prototypes/acquisition_parameters_STEM-DPC.toml")
+@click.argument(
+    "acquisition_settings_file",
+    type=str,
+    default="prototypes/acquisition_parameters_STEM-DPC.toml",
+)
 def cli(detector_settings_file, acquisition_settings_file):
     maybe_setup_tracing(service_name="libertem-live-server")
     logging.basicConfig(level=logging.INFO)

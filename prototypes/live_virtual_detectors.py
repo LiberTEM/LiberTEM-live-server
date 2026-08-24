@@ -6,21 +6,19 @@ UDFs (this is a limitation that can be lifted in production, this is only to
 demonstrate that widget interactivity is feasible).
 """
 
-import sys
-import logging
-import time
-import json
 import asyncio
+import json
+import logging
 import threading
+import time
 import warnings
-from typing_extensions import TypedDict
 
 import click
 import numpy as np
-import websockets
 import rerun as rr
+import websockets
 from libertem.viz.base import visualize_simple
-
+from typing_extensions import TypedDict
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +34,7 @@ class ResultItem(TypedDict):
         'udf_name': 'monitor_partition'
     }
     """
+
     # list[int] because JSON doesn't tuple
     shape: list[int]
     damage_shape: list[int]
@@ -88,9 +87,9 @@ class Plotter:
                         if len(arr.shape) == 2:
                             viz = visualize_simple(arr, damage=damage)
 
-                            rr.log(key, rr.Image(viz, color_model='RGBA'))
+                            rr.log(key, rr.Image(viz, color_model="RGBA"))
 
-                t1 = time.time()
+                # t1 = time.time()
                 if len(keys) > 0:
                     # print(f"plot updates: {t1-t0:.2f}s")
                     pass
@@ -119,14 +118,16 @@ class State:
         damage: bytes,
     ):
         # For some reason one may get shape mismatch or invalid types?
+        # Not observed with simplified transport protocol
         try:
-            new_arr = np.frombuffer(compressed_data, dtype=item['dtype'])
-            new_arr = new_arr.reshape(item['shape'])
-            damage_arr = np.frombuffer(damage, dtype=bool).reshape(item['damage_shape'])
+            new_arr = np.frombuffer(compressed_data, dtype=item["dtype"])
+            new_arr = new_arr.reshape(item["shape"])
+            damage_arr = np.frombuffer(damage, dtype=bool).reshape(item["damage_shape"])
         except Exception as e:
             warnings.warn(str(e))
-            damage_arr = None
-            new_arr = None
+            raise
+            # damage_arr = None
+            # new_arr = None
         if new_arr is not None:
             with self.data_lock:
                 self._gen_counter += 1
@@ -144,7 +145,11 @@ class State:
 
 class RecvThread(threading.Thread):
     def __init__(
-        self, state: State, todo_event: threading.Event, plotter: Plotter, url: str,
+        self,
+        state: State,
+        todo_event: threading.Event,
+        plotter: Plotter,
+        url: str,
     ):
         self.state = state
         self.todo = todo_event
@@ -156,7 +161,8 @@ class RecvThread(threading.Thread):
         while True:
             try:
                 async with websockets.connect(
-                    self.url, max_size=16*1024*1024,
+                    self.url,
+                    max_size=16 * 1024 * 1024,
                 ) as websocket:
                     last_msg = None
 
@@ -169,27 +175,26 @@ class RecvThread(threading.Thread):
 
                                 # print(decoded_msg)
 
-                                event = decoded_msg['event']
+                                event = decoded_msg["event"]
                                 if event == "ACQUISITION_STARTED":
                                     print(f"acquisition started: {decoded_msg['id']}")
                                     self.state.acquisition_started(
-                                        acq_id=decoded_msg['id']
+                                        acq_id=decoded_msg["id"]
                                     )
                                 elif event == "ACQUISITION_ENDED":
                                     self.state.acquisition_ended(
-                                        acq_id=decoded_msg['id']
+                                        acq_id=decoded_msg["id"]
                                     )
                                 elif event == "RESULT":
-                                    delta = 0.0
                                     delta_apply = 0.0
-                                    for chan in decoded_msg['channels']:
+                                    for chan in decoded_msg["channels"]:
                                         msg = await websocket.recv()
                                         msg_damage = await websocket.recv()
                                         # print(f"binary message of length {len(msg)}")
                                         # print(chan)
                                         t0 = time.time()
                                         self.state.apply_result_item(
-                                            acq_id=decoded_msg['id'],
+                                            acq_id=decoded_msg["id"],
                                             item=chan,
                                             compressed_data=msg,
                                             damage=msg_damage,
@@ -201,7 +206,7 @@ class RecvThread(threading.Thread):
                                 else:
                                     print(f"last msg: {last_msg}")
                             except json.JSONDecodeError as e:
-                                warnings.warn(msg.decode('utf8') + str(e))
+                                warnings.warn(msg.decode("utf8") + str(e))
                     finally:
                         pass
             except OSError as e:
@@ -210,17 +215,16 @@ class RecvThread(threading.Thread):
                 if "111" in str(e):
                     # reconnect
                     print("Trying to reconnect...")
-                    time.sleep(1)
+                    await asyncio.sleep(1)
                     break
                 else:
                     raise
-
 
     async def restart_loop(self):
         while True:
             try:
                 await self.main()
-            except Exception as e:
+            except Exception:
                 log.exception("got an exception in the main loop, reconnecting")
                 raise
                 continue
@@ -230,8 +234,8 @@ class RecvThread(threading.Thread):
 
 
 @click.command()
-@click.option('--url', type=str, default='ws://localhost:8444')
-@click.argument('name', default='live server demo')
+@click.option("--url", type=str, default="ws://localhost:8444")
+@click.argument("name", default="live server demo")
 def main(url, name):
     rr.init(name)
     rr.spawn()
@@ -240,9 +244,7 @@ def main(url, name):
     state = State(todo_event=todo)
 
     plotter = Plotter(state=state, todo_event=todo)
-    recv = RecvThread(
-        state=state, todo_event=todo, plotter=plotter, url=url
-    )
+    recv = RecvThread(state=state, todo_event=todo, plotter=plotter, url=url)
     recv.daemon = True
     recv.start()
 
